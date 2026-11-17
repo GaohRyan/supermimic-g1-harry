@@ -1,0 +1,136 @@
+From 7ed870044b1d8efcf94ff0af66d1df03381879bb Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:51:09 -0500
+Subject: [PATCH 04/19] opt: reset sampler uses horizon-normalised return-to-go
+ for episodes that end without failure (clip_end_norm)
+
+The return-binned sampler read 'few steps left before the clip end' as 'hard': in the sim2real-dr run the last two
+bins of each clip (0.9% of frames) received 40.5% of all resets and truly hard clips got no extra weight.
+With --env.sampler-clip-end-norm the return-to-go of episodes that end by clip end or time-out is rescaled by
+1/(1-gamma^remaining); steps with fewer than 25 remaining steps are dropped; failed episodes are unchanged.
+---
+ src/supermimic/config.py                |  1 +
+ src/supermimic/envs/mdp/commands.py     | 11 ++++++++
+ src/supermimic/envs/tracking_env_cfg.py |  2 ++
+ src/supermimic/training/loop.py         |  1 +
+ tests/test_sampler_clip_end_norm.py     | 35 +++++++++++++++++++++++++
+ 5 files changed, 50 insertions(+)
+ create mode 100644 tests/test_sampler_clip_end_norm.py
+
+diff --git a/src/supermimic/config.py b/src/supermimic/config.py
+index b219cb3..5d6b86f 100644
+--- a/src/supermimic/config.py
++++ b/src/supermimic/config.py
+@@ -35,6 +35,7 @@ class EnvCfg:
+     anchor_obs: bool = False
+     sim2real_dr: bool = False  # optimisation line: extra dynamics randomisation, xi grows to 38-D
+     action_delay_max: int = 0  # optimisation line: action delay U{0..N} control steps (env and imagination)
++    sampler_clip_end_norm: bool = False  # optimisation line: reset sampler uses horizon-normalised return-to-go
+     goal_contract: str = "cuboi"  # "official" = goal layout + anchor body of the official release (needs anchor_obs_mode ori_window)
+     anchor_obs_mode: str = "full"  # with anchor_obs: "full" = position (3) + rot6d (6); "ori" = rot6d (6) only (IMU-observable)
+ 
+diff --git a/src/supermimic/envs/mdp/commands.py b/src/supermimic/envs/mdp/commands.py
+index 6dd1eda..a4d3ff6 100644
+--- a/src/supermimic/envs/mdp/commands.py
++++ b/src/supermimic/envs/mdp/commands.py
+@@ -240,6 +240,15 @@ class MultiClipMotionCommand(CommandTerm):
+             else:
+                 remaining = lens[:, None] - torch.arange(T, device=self.device)[None, :]
+                 tmask = tmask & ~(truncated[:, None] & (remaining < cfg.min_remaining_steps))
++        if cfg.clip_end_norm:
++            # Episodes that end without a failure (clip end or time-out) have a return-to-go that shrinks only because
++            # few steps are left. Rescale it to the full-horizon equivalent so that "little time left" is not read as
++            # "hard"; failed episodes are left as they are. Steps too close to the end are dropped (too noisy).
++            ended_ok = ~terminated
++            remaining = (lens[:, None] - torch.arange(T, device=self.device)[None, :]).clamp_min(0).double()
++            scale = 1.0 / (1.0 - cfg.gamma ** remaining).clamp_min(1e-6)
++            rtg = torch.where(ended_ok[:, None], rtg * scale, rtg)
++            tmask = tmask & ~(ended_ok[:, None] & (remaining < cfg.clip_end_min_steps))
+         valid = tmask.reshape(-1)
+         b = bins.reshape(-1)[valid]
+         g = rtg.reshape(-1)[valid].float()
+@@ -427,6 +436,8 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
+     ema_alpha: float = 0.05
+     memory_alpha: float = 0.01
+     min_remaining_steps: int = 100
++    clip_end_norm: bool = False  # optimisation line: horizon-normalised return-to-go for episodes that end without failure
++    clip_end_min_steps: int = 25
+     max_logged_steps: int = 1024
+     compact_library: bool = False
+     library_fp16: bool = True
+diff --git a/src/supermimic/envs/tracking_env_cfg.py b/src/supermimic/envs/tracking_env_cfg.py
+index ee89681..dee49f3 100644
+--- a/src/supermimic/envs/tracking_env_cfg.py
++++ b/src/supermimic/envs/tracking_env_cfg.py
+@@ -98,6 +98,7 @@ class SuperMimicEnvCfgArgs:
+     goal_contract: str = "cuboi"  # "official" = official release layout: strided joint targets, anchor body = pelvis
+     sim2real_dr: bool = False  # optimisation line: armature / kp / kd / joint damping / friction loss randomisation (with domain_randomization)
+     action_delay_max: int = 0  # optimisation line: executed action delayed by U{0..N} control steps per episode (with domain_randomization)
++    sampler_clip_end_norm: bool = False  # optimisation line: horizon-normalised return-to-go in the reset sampler
+     debug_vis: bool = False  # draw the reference ghost in the viewer (scripts/play.py)
+     extra_command_kwargs: dict = field(default_factory=dict)
+ 
+@@ -171,6 +172,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
+             velocity_range=vel_range if a.reset_noise else {},
+             joint_position_range=(-0.1, 0.1) if a.reset_noise else (0.0, 0.0),
+             sampling_mode=a.sampling_mode,  # type: ignore[arg-type]
++            clip_end_norm=a.sampler_clip_end_norm,
+             compact_library=a.compact_library,
+             debug_vis=a.debug_vis,
+             **a.extra_command_kwargs,
+diff --git a/src/supermimic/training/loop.py b/src/supermimic/training/loop.py
+index 50085df..db8155c 100644
+--- a/src/supermimic/training/loop.py
++++ b/src/supermimic/training/loop.py
+@@ -90,6 +90,7 @@ class Trainer:
+                 goal_contract=cfg.env.goal_contract,
+                 sim2real_dr=cfg.env.sim2real_dr,
+                 action_delay_max=cfg.env.action_delay_max,
++                sampler_clip_end_norm=cfg.env.sampler_clip_end_norm,
+                 seed=cfg.seed + 1000 * self.rank,
+             ),
+             device=self.device,
+diff --git a/tests/test_sampler_clip_end_norm.py b/tests/test_sampler_clip_end_norm.py
+new file mode 100644
+index 0000000..ac18ccd
+--- /dev/null
++++ b/tests/test_sampler_clip_end_norm.py
+@@ -0,0 +1,35 @@
++"""Reset sampler: horizon-normalised return-to-go (clip_end_norm). Constant reward, episodes ending at the clip end must
++not look harder than mid-clip steps; failed episodes must still look hard. Pure torch (stub env)."""
++import types
++
++import torch
++
++from supermimic.envs.mdp.commands import MultiClipMotionCommand
++
++
++def _run(clip_end_norm: bool, terminated: bool):
++    n, T, nb = 4, 300, 6
++    lib = types.SimpleNamespace(num_bins=nb)
++    cfg = types.SimpleNamespace(gamma=0.99, ema_alpha=1.0, min_remaining_steps=100, clip_end_norm=clip_end_norm, clip_end_min_steps=25)
++    env = types.SimpleNamespace(termination_manager=types.SimpleNamespace(terminated=torch.full((n,), terminated)))
++    me = types.SimpleNamespace(
++        cfg=cfg, library=lib, device="cpu", _env=env, bootstrap_fn=None,
++        ep_len=torch.full((n,), T), ep_rewards=torch.full((n, T), 0.08),
++        ep_bins=(torch.arange(T) // 50).repeat(n, 1), clip_end=torch.ones(n, dtype=torch.bool),
++        _gamma_pow=0.99 ** torch.arange(T, dtype=torch.float64),
++        bin_return=torch.zeros(nb), metrics={"episode_return_to_go": torch.zeros(n)},
++    )
++    MultiClipMotionCommand._finalize_episodes(me, torch.arange(n))
++    return me.bin_return
++
++
++def test_clip_end_no_longer_looks_hard():
++    old = _run(False, False)
++    new = _run(True, False)
++    assert old[-1] < 0.6 * old[0]  # the bias: last bin of the clip looks much harder
++    assert (new.max() - new.min()) / new.mean() < 0.02  # constant reward -> flat after normalisation
++    assert abs(new.mean().item() - 8.0) < 0.2  # 0.08 / (1 - 0.99)
++
++
++def test_failures_keep_low_return():
++    assert torch.allclose(_run(True, True), _run(False, True))
+-- 
+2.43.0
+

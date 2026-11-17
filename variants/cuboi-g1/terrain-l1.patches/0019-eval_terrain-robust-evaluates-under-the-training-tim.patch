@@ -1,0 +1,58 @@
+From eda7fdb1418924c69de44f1d42c003d67041a4b4 Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 22:56:03 -0500
+Subject: [PATCH 19/19] eval_terrain: --robust evaluates under the
+ training-time perturbations (noise, randomisation, action delay, scan noise)
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ scripts/eval_terrain.py | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/scripts/eval_terrain.py b/scripts/eval_terrain.py
+index 7f06570..9be6ec7 100644
+--- a/scripts/eval_terrain.py
++++ b/scripts/eval_terrain.py
+@@ -44,7 +44,7 @@ def sha256(path: Path) -> str:
+ @torch.no_grad()
+ def main(ckpt: Path, out: Path, npz_dir: Path = Path("data/npz/lafan1"), device: str = "cuda:0", types: tuple[str, ...] = ("flat", "stairs_up", "stairs_down", "stairs_random", "slope", "rough"),
+          levels: tuple[int, ...] = (0, 3, 6, 9), per_tile: int = 64, seconds: float = 10.0, scan: str = "terrain", scan_relief: float = 1.0, seed: int = 0,
+-         heightfields: bool = False) -> None:
++         heightfields: bool = False, robust: bool = False) -> None:
+     """heightfields: add the slope and rough height-field tiles to the terrain although the run was trained without them
+     (to measure how the simulator's height-field contact compares with the flat box tile)."""
+     assert scan in ("terrain", "flat"), scan
+@@ -65,8 +65,8 @@ def main(ckpt: Path, out: Path, npz_dir: Path = Path("data/npz/lafan1"), device:
+     files = [str(f) for f in discover_npz(npz_dir)]
+     n = per_tile * len(types) * len(levels)
+     args = SuperMimicEnvCfgArgs(
+-        npz_files=files, num_envs=n, future_frames=env_cfg_saved["future_frames"], episode_length_s=seconds, action_noise_std=0.0, obs_noise=False, reset_noise=False,
+-        domain_randomization=False, sampling_mode="return", record_transitions=False, seed=seed, anchor_obs=env_cfg_saved.get("anchor_obs", False),
++        npz_files=files, num_envs=n, future_frames=env_cfg_saved["future_frames"], episode_length_s=seconds, action_noise_std=0.1 if robust else 0.0, obs_noise=robust, reset_noise=robust,
++        domain_randomization=robust, sim2real_dr=robust and bool(env_cfg_saved.get("sim2real_dr", False)), action_delay_max=int(env_cfg_saved.get("action_delay_max", 0)) if robust else 0, sampling_mode="return", record_transitions=False, seed=seed, anchor_obs=env_cfg_saved.get("anchor_obs", False),
+         anchor_obs_mode=env_cfg_saved.get("anchor_obs_mode", "full"), goal_contract=env_cfg_saved.get("goal_contract", "cuboi"), sampler_clip_end_norm=True,
+         terrain=targs, terrain_max_init_level=None, terrain_clip_regex=env_cfg_saved.get("terrain_clip_regex", r"^(walk|run|sprint)"),
+         extra_command_kwargs={"terrain_curriculum": False},
+@@ -85,7 +85,9 @@ def main(ckpt: Path, out: Path, npz_dir: Path = Path("data/npz/lafan1"), device:
+         ent.terrain_levels[:] = torch.tensor([tiles[i][1] for i in tile_of.tolist()], device=device)
+         ent.env_origins[:] = ent.terrain_origins[ent.terrain_levels, ent.terrain_types]
+         obs, _ = env.reset()
+-        scan_fn = actor_scan_for(policy, env, None if scan == "flat" else cmd.terrain)
++        # robust: the training-time perturbations (sensor noise, action noise 0.1, friction / encoder bias / COM and the
++        # sim-to-real randomisation with action delay, reset noise) and the scan noise the actor was trained with
++        scan_fn = actor_scan_for(policy, env, None if scan == "flat" else cmd.terrain, noise=float(env_cfg_saved.get("scan_noise", 0.03)) if robust else 0.0)
+         if scan_fn is not None and scan_relief != 1.0:
+             scan_fn = relief_scaled(scan_fn, scan_relief)
+ 
+@@ -96,7 +98,7 @@ def main(ckpt: Path, out: Path, npz_dir: Path = Path("data/npz/lafan1"), device:
+         res = run_tile_windows(cmd, step, obs, policy, scan_fn, tile_of, tiles, int(env.max_episode_length), targs)
+         out.mkdir(parents=True, exist_ok=True)
+         report = {
+-            "schema_version": 1, "protocol_id": "cuboi-g1/terrain-window-nominal-v1", "checkpoint": str(ckpt), "checkpoint_sha256": sha256(ckpt),
++            "schema_version": 1, "protocol_id": "cuboi-g1/terrain-window-" + ("robust-v1" if robust else "nominal-v1"), "checkpoint": str(ckpt), "checkpoint_sha256": sha256(ckpt),
+             "checkpoint_meta": {"iteration": ck.get("iteration"), "num_updates": ck.get("num_updates")}, "policy_scan_mode": policy.cfg.scan_mode,
+             "scan_fed": scan, "scan_relief": scan_relief, "terrain_args": vars(targs), "per_tile": per_tile, "seconds": seconds, "seed": seed,
+             "env_args": {k: (vars(v) if k == "terrain" else v) for k, v in vars(args).items() if k != "npz_files"},
+-- 
+2.43.0
+

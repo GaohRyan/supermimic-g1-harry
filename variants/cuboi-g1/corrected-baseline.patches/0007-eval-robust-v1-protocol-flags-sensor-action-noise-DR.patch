@@ -1,0 +1,153 @@
+From bf237d72a4875da6039116a638c1c9086a6bad6b Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 01:27:33 -0500
+Subject: [PATCH] eval: robust-v1 protocol flags (sensor/action noise, DR,
+ reset noise); export sim2sim contract
+
+- eval_fullclip_traj.py: --obs-noise / --action-noise-std / --domain-randomization / --reset-noise / --seed.
+  Defaults keep the nominal-v2 protocol byte-for-byte; any flag switches protocol_id to *-robust-v1.
+- export_sim2sim_contract.py: writes the compiled nominal MjModel (.mjb) and a JSON contract
+  (joint/actuator order, action scale/offset, default pose, solver options) for a CPU MuJoCo closed loop.
+
+Training code (src/) is unchanged relative to 4046330.
+---
+ scripts/eval_fullclip_traj.py      | 17 +++++--
+ scripts/export_sim2sim_contract.py | 73 ++++++++++++++++++++++++++++++
+ 2 files changed, 85 insertions(+), 5 deletions(-)
+ create mode 100644 scripts/export_sim2sim_contract.py
+
+diff --git a/scripts/eval_fullclip_traj.py b/scripts/eval_fullclip_traj.py
+index d81d5e2..e1a86f9 100644
+--- a/scripts/eval_fullclip_traj.py
++++ b/scripts/eval_fullclip_traj.py
+@@ -2,7 +2,9 @@
+ 
+ Protocol (frozen, see artifacts/projects/cuboi-g1/protocols/fullclip-nominal-v1.json):
+   * one env per clip, every clip starts at its first frame (forced_frame = clip_start);
+-  * deterministic policy, action noise 0, no observation noise, reset_noise=False;
++  * deterministic policy, action noise 0, no observation noise, reset_noise=False (defaults; the
++    --obs-noise / --action-noise-std / --domain-randomization / --reset-noise flags select the
++    robust-v1 protocol instead and are recorded in the report);
+   * domain_randomization=False -> a freshly built nominal env: no COM offset event, no encoder-bias
+     event, foot friction fixed to 1.0 at startup (verified at runtime and written to the report);
+   * auto_reset=False, so the state reached by the last action (s_{T+1}, pre-reset) is returned by
+@@ -93,11 +95,16 @@ def nominal_checks(env) -> dict:
+ 
+ @torch.no_grad()
+ def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path = Path("data/npz/lafan1"),
+-         device: str = "cuda:0", max_steps: int = 20000, data_label: str = "unspecified", window_steps: int = 0) -> None:
++         device: str = "cuda:0", max_steps: int = 20000, data_label: str = "unspecified", window_steps: int = 0,
++         obs_noise: bool = False, action_noise_std: float = 0.0, domain_randomization: bool = False, reset_noise: bool = False,
++         seed: int = 0) -> None:
+     """window_steps > 0 -> protocol window10s-nominal: non-overlapping windows of window_steps control steps tiled
+     from each clip start (last partial window dropped), one env per window, each started from the exact reference
+     state at its first frame; completed = reaches window_steps without termination."""
+     t0 = time.time()
++    # Any non-default noise / randomisation flag switches the protocol id to *-robust-v1 (training-distribution
++    # perturbations: sensor noise, action noise, per-reset friction + encoder bias, startup COM offset, reset noise).
++    nominal_protocol = not (obs_noise or domain_randomization or reset_noise or action_noise_std > 0)
+     files = [str(f) for f in discover_npz(npz_dir, names=clips)] if clips else [str(f) for f in discover_npz(npz_dir)]
+     assert files, f"no npz files in {npz_dir}"
+     policy, ck = safe_load_policy(ckpt, device)
+@@ -111,8 +118,8 @@ def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path =
+     n = len(win)
+     args = SuperMimicEnvCfgArgs(
+         npz_files=files, num_envs=n, future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
+-        action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False,
+-        sampling_mode="start", record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False),
++        action_noise_std=action_noise_std, obs_noise=obs_noise, reset_noise=reset_noise, domain_randomization=domain_randomization,
++        sampling_mode="start", record_transitions=False, seed=seed, anchor_obs=cfg["env"].get("anchor_obs", False),
+     )
+     from mjlab.envs import ManagerBasedRlEnv
+     from mjlab.utils.torch import configure_torch_backends
+@@ -228,7 +235,7 @@ def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path =
+             "all_finite": all(r["finite"] for r in res), "max_recorded_steps": T,
+         }
+         report = {
+-            "schema_version": 1, "protocol_id": ("cuboi-g1/window10s-nominal-v2" if window_steps > 0 else "cuboi-g1/fullclip-nominal-v2"), "data_label": data_label,
++            "schema_version": 1, "protocol_id": ("cuboi-g1/window10s-" if window_steps > 0 else "cuboi-g1/fullclip-") + ("nominal-v2" if nominal_protocol else "robust-v1"), "data_label": data_label,
+             "checkpoint": str(ckpt), "checkpoint_sha256": sha256(ckpt), "checkpoint_meta": ck["meta"],
+             "env_args": {k: v for k, v in vars(args).items() if k != "npz_files"}, "auto_reset": False,
+             "start_frame_is_clip_start": start_frame_ok, "nominal_checks": nominal, "term_names": term_names,
+diff --git a/scripts/export_sim2sim_contract.py b/scripts/export_sim2sim_contract.py
+new file mode 100644
+index 0000000..6f7c76e
+--- /dev/null
++++ b/scripts/export_sim2sim_contract.py
+@@ -0,0 +1,73 @@
++"""Export what a second simulator needs to run this policy closed loop (sim2sim, PIPELINE §7).
++
++Writes <out>/g1_nominal.mjb (the compiled host-side MjModel of the nominal env: same MJCF, actuators,
++armature, friction 1.0) and <out>/contract.json (joint / actuator order, action scale and offset,
++default pose, soft limits, timestep, decimation, solver options, tracked bodies).
++
++  uv run python scripts/export_sim2sim_contract.py --npz-dir <npz> --out <dir>
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import mujoco
++import torch
++import tyro
++
++from supermimic.envs.mdp.motion_library import discover_npz
++from supermimic.envs.tracking_env_cfg import ANCHOR_BODY, FOOT_GEOM_REGEX, ROOT_BODY, TRACKED_BODIES, SuperMimicEnvCfgArgs, make_env_cfg
++
++
++def main(npz_dir: Path, out: Path, device: str = "cuda:0") -> None:
++    files = [str(f) for f in discover_npz(npz_dir)][:1]
++    args = SuperMimicEnvCfgArgs(npz_files=files, num_envs=1, future_frames=10, episode_length_s=10.0, action_noise_std=0.0, obs_noise=False,
++                                reset_noise=False, domain_randomization=False, sampling_mode="start", record_transitions=False, seed=0)
++    from mjlab.envs import ManagerBasedRlEnv
++
++    env_cfg = make_env_cfg(args)
++    env = ManagerBasedRlEnv(env_cfg, device=device)
++    try:
++        env.reset()
++        m = env.sim.mj_model
++        robot = env.scene["robot"]
++        act = env.action_manager.get_term("joint_pos")
++        out.mkdir(parents=True, exist_ok=True)
++        mujoco.mj_saveModel(m, str(out / "g1_nominal.mjb"))
++        n = lambda t, i: mujoco.mj_id2name(m, t, i)  # noqa: E731
++        tl = lambda x: x[0].tolist() if torch.is_tensor(x) else float(x)  # noqa: E731
++        ctrl_ids = robot.indexing.ctrl_ids.tolist()
++        joint_ids = robot.indexing.joint_ids.tolist()
++        contract = {
++            "schema_version": 1, "mujoco_version": mujoco.__version__, "nq": m.nq, "nv": m.nv, "nu": m.nu, "nbody": m.nbody,
++            "timestep": float(m.opt.timestep), "decimation": int(env_cfg.decimation), "control_dt": float(m.opt.timestep) * int(env_cfg.decimation),
++            "opt": {"integrator": int(m.opt.integrator), "solver": int(m.opt.solver), "iterations": int(m.opt.iterations), "ls_iterations": int(m.opt.ls_iterations),
++                    "cone": int(m.opt.cone), "impratio": float(m.opt.impratio), "tolerance": float(m.opt.tolerance), "ls_tolerance": float(m.opt.ls_tolerance),
++                    "gravity": list(map(float, m.opt.gravity)), "noslip_iterations": int(m.opt.noslip_iterations)},
++            "robot_joint_names": list(robot.joint_names), "robot_joint_ids_in_model": joint_ids,
++            "model_joint_names": [n(mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(m.njnt)],
++            "actuator_names": [n(mujoco.mjtObj.mjOBJ_ACTUATOR, i) for i in range(m.nu)],
++            "actuator_joint_names": [n(mujoco.mjtObj.mjOBJ_JOINT, int(m.actuator_trnid[i, 0])) for i in range(m.nu)],
++            "robot_ctrl_ids": ctrl_ids,
++            "actuator_gainprm0": [float(m.actuator_gainprm[i, 0]) for i in range(m.nu)],
++            "actuator_biasprm": [[float(x) for x in m.actuator_biasprm[i, :3]] for i in range(m.nu)],
++            "actuator_forcerange": [[float(x) for x in m.actuator_forcerange[i]] for i in range(m.nu)],
++            "actuator_ctrlrange": [[float(x) for x in m.actuator_ctrlrange[i]] for i in range(m.nu)],
++            "action_scale": tl(act._scale), "action_offset": tl(act._offset),
++            "action_joint_names": list(act._target_names),
++            "default_joint_pos": robot.data.default_joint_pos[0].tolist(),
++            "soft_joint_pos_limits": robot.data.soft_joint_pos_limits[0].tolist(),
++            "env_origin": env.scene.env_origins[0].tolist(),
++            "tracked_bodies": list(TRACKED_BODIES), "anchor_body": ANCHOR_BODY, "root_body": ROOT_BODY, "foot_geom_regex": FOOT_GEOM_REGEX,
++            "qpos0": [float(x) for x in m.qpos0], "key_nkey": int(m.nkey),
++            "reward_dt_scale_note": "reward per control step as returned by env.step (max 0.1 = dt * 5.0)",
++        }
++        (out / "contract.json").write_text(json.dumps(contract, indent=1))
++        print(json.dumps({k: contract[k] for k in ("mujoco_version", "nq", "nu", "timestep", "decimation")}))
++    finally:
++        env.close()
++
++
++if __name__ == "__main__":
++    tyro.cli(main)
+-- 
+2.43.0
+

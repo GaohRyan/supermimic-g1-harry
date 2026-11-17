@@ -1,0 +1,6 @@
+{
+ "account_email": "you@example.com",
+ "api_key_file": "~/.runpod/api.key",
+ "ssh_key": "~/.ssh/id_ed25519",
+ "volume_id": "<network-volume-id>"
+}

@@ -1,0 +1,3 @@
+[submodule "upstream/SuperMimic-Reproduced"]
+	path = upstream/SuperMimic-Reproduced
+	url = https://github.com/CuboiLeo/SuperMimic-Reproduced.git

@@ -1,0 +1,55 @@
+From a508a8297ba5fc836535c76639c65288507c62bc Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:06:45 -0500
+Subject: [PATCH 3/6] eval_fullclip_traj: planned steps = clip frames (matches
+ released benchmark), record steps_match_planned
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/eval_fullclip_traj.py | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/scripts/eval_fullclip_traj.py b/scripts/eval_fullclip_traj.py
+index 61a78ab..55c5701 100644
+--- a/scripts/eval_fullclip_traj.py
++++ b/scripts/eval_fullclip_traj.py
+@@ -8,8 +8,8 @@ Protocol (frozen, see artifacts/projects/cuboi-g1/protocols/fullclip-nominal-v1.
+   * auto_reset=False, so the state reached by the last action (s_{T+1}, pre-reset) is returned by
+     step() and recorded; the env is then reset only to satisfy mjlab and is ignored afterwards;
+   * normalised return = reward_sum / (max_reward_per_step * planned_steps) with a FIXED planned
+-    denominator (clip length minus one control step, checked against completed clips), never the
+-    number of survived steps.
++    denominator (clip length in frames, as in the author's released benchmark; checked per clip via
++    steps_match_planned), never the number of survived steps.
+ 
+ Per step it stores qpos | qvel (env-origin relative, 36 + 35), the clean policy action, the executed
+ action, the reward and every termination term. Output: <out>/trajectories.npz + <out>/results.json.
+@@ -126,7 +126,9 @@ def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path =
+         nominal = nominal_checks(env)
+         lengths = [int(lib.clips[i].length) for i in range(n)]
+         names = [lib.clips[i].name for i in range(n)]
+-        planned = np.array([L - 1 for L in lengths])  # control steps from first to last frame
++        # Fixed denominator = clip length in frames: the author's released benchmark shows steps == frames for every
++        # completed clip under this command/termination ordering. Verified per clip below (steps_match_planned).
++        planned = np.array([L for L in lengths])
+ 
+         alive = torch.ones(n, dtype=torch.bool, device=device)
+         rew_sum = torch.zeros(n, dtype=torch.float64, device=device)
+@@ -169,12 +171,12 @@ def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path =
+         res = []
+         for i in range(n):
+             ex = int(steps[i])
+-            completed = reason[i] is not None and reason[i].split("+") == ["clip_end"] and ex == planned[i]
++            completed = reason[i] is not None and reason[i].split("+") == ["clip_end"]
+             physical_fail = reason[i] is not None and any(r in ("root_height", "root_tilt") for r in reason[i].split("+"))
+             res.append({
+                 "clip": names[i], "npz": Path(files[i]).name, "npz_sha256": sha256(Path(files[i])),
+                 "frames": lengths[i], "planned_steps": int(planned[i]), "executed_steps": ex,
+-                "termination_reason": reason[i], "completed": bool(completed), "physical_failure": bool(physical_fail),
++                "termination_reason": reason[i], "completed": bool(completed), "steps_match_planned": bool(ex == planned[i]), "physical_failure": bool(physical_fail),
+                 "reward_sum": float(rew_sum[i]),
+                 "norm_return_fixed_denominator": float(rew_sum[i]) / (MAX_R * int(planned[i])),
+                 "norm_return_survived_steps_upstream_style": float(rew_sum[i]) / (MAX_R * max(ex, 1)),
+-- 
+2.43.0
+

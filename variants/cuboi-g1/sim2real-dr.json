@@ -1,0 +1,29 @@
+{
+ "project_id": "cuboi-g1",
+ "line": "opt",
+ "base_repo": "https://github.com/CuboiLeo/SuperMimic-Reproduced.git",
+ "base_commit": "ba6105349069bf040f1fdad60873d13138d505a2",
+ "parent_variant": "official-contract",
+ "branch": "opt/sim2real-dr",
+ "variant_commit": "6ce075d00272c2a0a89836efd08359afe4365673",
+ "variant_tree": "798d74cb99b8031024a00bd44d66f3bdebeb689b",
+ "summary": "official-contract + action delay U{0..2} steps and dynamics randomisation (armature 0.7-1.5x, kp/kd 0.85-1.15x, passive damping up to 10 x armature, friction loss up to 20 x armature); the five scalars extend the world-model context xi to 38-D",
+ "patches": [
+  {
+   "file": "0001-opt-anchor_obs_mode-ori-reference-anchor-orientation.patch",
+   "sha256": "a4ed812567ca0c6f0c90215617bf847842a54efe1b91c41cd4f9bae38ed431e5",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0002-repro-goal_contract-official-actor-goal-layout-and-a.patch",
+   "sha256": "099d5ee41db65e254a937fbed7daa714829da337aff551a081a5f010ecbbef73",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0003-opt-sim-to-real-randomisation-action-delay-armature-.patch",
+   "sha256": "05cf4a0d41c96fe4ff206df31032a6b8a71731efcc43aee067255ccd1889da57",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  }
+ ],
+ "note_public": "Patch author lines were normalised for publication; variant_tree is unchanged, commit SHAs after git am differ."
+}

@@ -1,0 +1,120 @@
+{
+ "schema_version": 1,
+ "config_id": "cuboi-g1/paper-contract-h32-4clip-seed0-v1",
+ "project_id": "cuboi-g1",
+ "variant": "corrected-baseline",
+ "variant_commit": "404633076cc1fd98df7b22d4ddb18e81334cb636",
+ "base_commit": "ba6105349069bf040f1fdad60873d13138d505a2",
+ "purpose": "P2 engineering diagnostic on fixed 4 clips, random init seed0",
+ "argv": [
+  "uv",
+  "run",
+  "--frozen",
+  "sm-train",
+  "--run-name",
+  "pc_h32-4clip-seed0",
+  "--seed",
+  "0",
+  "--data.npz-dir",
+  "<npz40>",
+  "--data.clips",
+  "walk1_subject1",
+  "dance1_subject1",
+  "jumps1_subject1",
+  "fight1_subject2",
+  "--env.num-envs",
+  "4096",
+  "--policy-trainer.batch-size",
+  "4096",
+  "--schedule.max-hours",
+  "1.2",
+  "--schedule.checkpoint-interval",
+  "2000"
+ ],
+ "paper_contract": {
+  "wm_window_k": 8,
+  "imagination_horizon_H": 32,
+  "num_envs": 4096,
+  "wm_batches_per_update": 10,
+  "wm_batch_size": 2048,
+  "actor_imagined_rollouts": 4096,
+  "replay_capacity_per_env": 1000,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "critic_epochs": 5,
+  "critic_minibatches": 4,
+  "utd_updates_per_env_step": 0.4,
+  "proprio_obs_dim": 93,
+  "history": 10,
+  "future_frames_K": 10,
+  "goal_dim": 680,
+  "latent_dim": 32,
+  "action": "absolute joint setpoint around default pose",
+  "anchor_obs": false,
+  "wm_hidden": [
+   2048,
+   2048,
+   2048
+  ],
+  "policy_hidden": [
+   2048,
+   1024,
+   512,
+   256
+  ],
+  "critic_hidden": [
+   256,
+   128
+  ],
+  "lr": 0.0004,
+  "lr_final_ratio": 0.03,
+  "warmup_iterations": 40
+ },
+ "implementation_conventions_not_in_paper": {
+  "reward_global_root_body": "torso_link (Cuboi; mjlab anchor reward functions)",
+  "termination_body": "pelvis (height 0.25 m, tilt 0.8, gravity-projection)",
+  "relative_body_yaw_alignment": "torso_link",
+  "state_layout": "71 = qpos36 | qvel35, env-origin relative",
+  "goal_features": "68 per frame from reference only (no robot state)",
+  "wm_loss": "Cuboi window_loss: sum over state dims, mean over batch; term BCE weight 1.0 (not changed)",
+  "done_labels": "corrected-baseline fix (transition rows done=0)",
+  "dr": "Cuboi: torso COM offset at startup, encoder bias and foot friction 0.3-1.2 per reset",
+  "action_noise_std": 0.1,
+  "obs_noise": true,
+  "reset_noise": true,
+  "sampling_mode": "return-based bins",
+  "precision": "Cuboi configure_torch_backends (TF32 on Ampere+)",
+  "episode_length_s": 10.0
+ },
+ "deviations_from_paper_contract": [
+  "GPU = RTX 5090 or L40S instead of H100",
+  "4-clip diagnostic instead of LAFAN40",
+  "per-session max_hours 1.2; multi-session warm restarts (replay/RNG/sim not restored)"
+ ],
+ "eval": {
+  "protocols": [
+   "cuboi-g1/fullclip-nominal-v2",
+   "cuboi-g1/window10s-nominal-v2"
+  ],
+  "checkpoints": "initial + every 2000 it + end of each session + final",
+  "clips": "the 4 training clips"
+ },
+ "acceptance_for_entering_4clip": "walk1 full clip completed with no physical failure and window10s completion 100%, or a clear diagnostic conclusion",
+ "clipset": {
+  "names": [
+   "walk1_subject1",
+   "dance1_subject1",
+   "jumps1_subject1",
+   "fight1_subject2"
+  ],
+  "npz_sha256": {
+   "dance1_subject1.npz": "6d90af932e0d551e5cb36986eba98c16fbab46715e37231cf7a59dab07086119",
+   "fight1_subject2.npz": "4d2f10e66c9933e815cc944640a8d9f413bcd28a422be2ac0e4e4d0674cd907b",
+   "jumps1_subject1.npz": "e4516b0be6569b44ee6028ac73d92c7dfad51e41391283794411eaea17894654",
+   "walk1_subject1.npz": "b3a2bbb3085b47cf5a13c5567c54b46cdf5151ac38d2629ee394c6adda2df2c6"
+  },
+  "source": "LAFAN1 rev ce15729 converted on tier C Pod (deterministic vs 2026-11-03 for the 4 overlapping clips)"
+ },
+ "clipset_sha256": "5cf03bea07f1bad69bc86f039460ab2d7161efdb5a57072ac387f53586d1296e",
+ "acceptance": "internal target: 4/4 full clips completed, 0 physical failures, macro window10s return >= 0.80 (full-clip return reported separately; drift-limited)"
+}

@@ -1,0 +1,54 @@
+{
+ "project_id": "cuboi-g1",
+ "line": "opt",
+ "base_repo": "https://github.com/CuboiLeo/SuperMimic-Reproduced.git",
+ "base_commit": "ba6105349069bf040f1fdad60873d13138d505a2",
+ "parent_variant": "wm-hard-mining",
+ "branch": "opt/optim-adamw-muon",
+ "variant_commit": "bc145895e23d80465a2da9b4008cc134e69b649b",
+ "variant_tree": "717a29a43d6cd7115f339e3007f94380d82a0c08",
+ "summary": "wm-hard-mining + AdamW (weight decay 0, numerically identical to the previous Adam) in all trainers and an optional Muon optimizer (weight decay 0.1, the PyTorch default the official release inherits) on the hidden Linear weights (wm_trainer.hidden_optimizer / policy_trainer.hidden_optimizer = muon)",
+ "patches": [
+  {
+   "file": "0001-opt-anchor_obs_mode-ori-reference-anchor-orientation.patch",
+   "sha256": "7f303558edc3d21630bc4e29cc433a5cd728146a5fc618226b1b943c12e518b9",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0002-repro-goal_contract-official-actor-goal-layout-and-a.patch",
+   "sha256": "e1237c2f50bb607b5e21dcb5d2bde8f5a7c6880fffa325df9b37547eef575d16",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0003-opt-sim-to-real-randomisation-action-delay-armature-.patch",
+   "sha256": "427ccab6f2597a97b37172b08403d412ea6cb3a4de04212ee25b086be77e04a2",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0004-opt-reset-sampler-uses-horizon-normalised-return-to-.patch",
+   "sha256": "697d90557a0e47c772394a2bf2886676938b4ee523c019e0afeeaf4bf43115e3",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0005-opt-hard-example-mining-of-world-model-training-wind.patch",
+   "sha256": "077903b9a1cb0a54a9b405c3f7d4eda2a24a17a533256d863fc4ef3c08b808e4",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0006-opt-mine-world-model-windows-by-one-step-error-on-in.patch",
+   "sha256": "3bd1ed8060848605062b6aa3c4e8a1c176e50c17415e0c21201590a6a23d8fc0",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0007-opt-AdamW-weight-decay-0-identical-to-the-previous-A.patch",
+   "sha256": "8042c9f253e3769e7479b1074474e6acba60e17a8df88d6d89940d561c1ff125",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0008-opt-spell-out-Muon-s-weight-decay-0.1-the-PyTorch-de.patch",
+   "sha256": "ea3f20e27e37fdd63def99e5b7f2d9e1a7973e06ae7453384d911b620fd4ba8c",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  }
+ ],
+ "note_public": "Patch author lines were normalised for publication; variant_tree is unchanged, commit SHAs after git am differ."
+}

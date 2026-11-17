@@ -1,0 +1,27 @@
+{
+ "schema_version": 1,
+ "protocol_id": "cuboi-g1/sim2sim-mujoco-cpu-fullclip-nominal-v1",
+ "frozen_utc": "2026-11-10",
+ "definition": "the same checkpoint runs closed loop in plain MuJoCo (C, CPU); observations, goal, reward and termination are computed analytically from the simulator state; replaying a logged trajectory does not count",
+ "contract": "exported in the Pod by scripts/export_sim2sim_contract.py: g1_nominal.mjb (compiled nominal model) + contract.json (timestep 0.005, decimation 4, solver settings, actuator order, action scale/offset, default pose, soft joint limits, env origin)",
+ "init": "logged Warp state at step 0 of each clip (reference first frame)",
+ "unit": "whole clip",
+ "denominator": "planned_steps = clip frames",
+ "max_reward_per_step": 0.1,
+ "termination": "paper rule re-evaluated on the CPU state: root height error 0.25 m, tilt 0.8 (gravity projection)",
+ "gates_before_closed_loop": [
+  "validate: analytic reward on logged Warp states vs logged reward (sum within 0.3%)",
+  "openloop: logged actions replayed from logged states, state error vs horizon (median root error < 1 mm at 8 steps)"
+ ],
+ "report": [
+  "cpu_completed",
+  "warp_completed",
+  "cpu_macro_return",
+  "warp_macro_return",
+  "only_cpu_failed",
+  "only_warp_failed",
+  "return_abs_diff_on_both_completed_mean"
+ ],
+ "implementation": "tools/sim2sim/sim2sim_mujoco_cpu.py validate|openloop|closed (.venv-sim, mujoco version must equal the exporter's)",
+ "not_covered": "sensor noise, actuator delay, contact-parameter mismatch; same MJCF and same solver family (this checks the simulator implementation, not model error)"
+}

@@ -1,0 +1,21 @@
+{
+ "project_id": "cuboi-g1",
+ "line": "opt",
+ "base_repo": "https://github.com/CuboiLeo/SuperMimic-Reproduced.git",
+ "base_commit": "ba6105349069bf040f1fdad60873d13138d505a2",
+ "parent_variant": "corrected-baseline",
+ "parent_variant_commit": "bf237d72a4875da6039116a638c1c9086a6bad6b",
+ "branch": "opt/anchor-ori",
+ "variant_commit": "dfaa3a7190f534a596b4b2b1fa0a52eac856a7cb",
+ "variant_tree": "2ca83836113ffeb2c78a7823ecd0c378618741e5",
+ "summary": "env.anchor_obs_mode=ori: the actor gets the reference anchor orientation (rot6d, 6-D) but not its position; default full keeps corrected-baseline behaviour",
+ "patches": [
+  {
+   "file": "0001-opt-anchor_obs_mode-ori-reference-anchor-orientation.patch",
+   "sha256": "3e38867516b2c05c00fbf8ef0a291fd673ea5994c099882382534e58c533fb9f",
+   "applies_on": "corrected-baseline @ bf237d7"
+  }
+ ],
+ "line_note": "2026-11-11 (D039): the official release gives the actor the reference orientation only, so this variant is the repro-line main observation; the \"opt\" label and config prefix are kept as created on 2026-11-10 to keep run names stable",
+ "note_public": "Patch author lines were normalised for publication; variant_tree is unchanged, commit SHAs after git am differ."
+}

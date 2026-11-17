@@ -1,0 +1,168 @@
+From 372ea6f4b487b43d4efe6548e7a22dc91feb808a Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 20:38:25 -0500
+Subject: [PATCH 18/19] terrain: progress term only near uneven terrain; hard
+ clips get a larger share of the flat-tile resets
+
+Line T1 lost 0.04 of flat full-clip return; without the progress term (line T2) the flat score came back by 0.025 but
+the share of 20 cm climbs actually completed fell by about 0.2. So: the term counts only where the height scan around
+the robot spans more than progress_relief (2 cm), and the clips that never start on stair tiles are sampled with
+weight flat_hard_boost (2) on flat tiles (their share of flat resets 0.49 -> 0.67).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ src/supermimic/config.py                | 2 ++
+ src/supermimic/envs/mdp/commands.py     | 5 +++++
+ src/supermimic/envs/mdp/rewards.py      | 4 ++++
+ src/supermimic/envs/tracking_env_cfg.py | 3 ++-
+ src/supermimic/imagination/compiled.py  | 6 +++++-
+ src/supermimic/training/loop.py         | 2 ++
+ src/supermimic/world_model/heads.py     | 3 ++-
+ 7 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/src/supermimic/config.py b/src/supermimic/config.py
+index f4b21f6..587e92c 100644
+--- a/src/supermimic/config.py
++++ b/src/supermimic/config.py
+@@ -50,6 +50,8 @@ class EnvCfg:
+     # front of the stairs). Measured on the references: a robot that tracks everything but steps on the spot keeps
+     # 0.84-0.87 of the maximum tracking reward on walking clips, more than the trained policy gets while it walks.
+     progress_weight: float = 1.0
++    progress_relief: float = 0.02  # m; the progress term counts only where the scan around the robot spans more than this (0 = everywhere, as in line T1)
++    flat_hard_boost: float = 2.0  # on flat tiles, sampling weight of the clips that never start on stair tiles (1 = no boost, as in line T1)
+ 
+ 
+ @dataclass
+diff --git a/src/supermimic/envs/mdp/commands.py b/src/supermimic/envs/mdp/commands.py
+index 6e85c7e..53677f0 100644
+--- a/src/supermimic/envs/mdp/commands.py
++++ b/src/supermimic/envs/mdp/commands.py
+@@ -485,6 +485,10 @@ class MultiClipMotionCommand(CommandTerm):
+             if on_terrain.any():
+                 pt = p * self.bin_on_terrain
+                 b[on_terrain] = torch.multinomial(pt / pt.sum(), int(on_terrain.sum()), replacement=True)
++            if cfg.flat_hard_boost != 1.0 and (~on_terrain).any():
++                # The clips that never start on a non-flat tile only get the flat-tile envs: give them a larger share there.
++                pf = p * (1.0 + (cfg.flat_hard_boost - 1.0) * (1.0 - self.bin_on_terrain))
++                b[~on_terrain] = torch.multinomial(pf / pf.sum(), int((~on_terrain).sum()), replacement=True)
+         u = torch.rand(n, device=self.device)
+         f = lib.bin_start[b] + (u * (lib.bin_end[b] - lib.bin_start[b]).float()).long()
+         f = torch.minimum(f, lib.last_frame_of(f) - 2).clamp_min(lib.clip_start[lib.frame_clip[f]])
+@@ -666,6 +670,7 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
+     terrain_task: bool = False
+     terrain_resolution: float = 0.025  # m per cell of the global height map
+     terrain_clip_regex: str = r"^(walk|run|sprint)"  # clips that may start on a non-flat tile; the others stay on flat tiles
++    flat_hard_boost: float = 1.0  # on flat tiles: sampling weight of the bins that may not start on a non-flat tile
+     terrain_curriculum: bool = True  # False: envs stay on the tile they were put on (evaluation)
+     level_up_reward_ratio: float = 0.8  # promote: mean reward >= this share of what the same motion bins earn on flat tiles,
+     level_up_progress: float = 0.7  # distance covered along the reference travel direction >= this share of the reference's,
+diff --git a/src/supermimic/envs/mdp/rewards.py b/src/supermimic/envs/mdp/rewards.py
+index 3adf99c..95377f6 100644
+--- a/src/supermimic/envs/mdp/rewards.py
++++ b/src/supermimic/envs/mdp/rewards.py
+@@ -43,6 +43,7 @@ class TrackingRewardCfg:
+     clearance_margin: float = 0.04  # m above the highest terrain point under / ahead of the foot
+     clearance_sole_offset: float = 0.04  # height of the ankle-roll link origin above the sole (stance value of the references: 0.036-0.044)
+     clearance_ahead: tuple[float, ...] = (0.0, 0.05, 0.10, 0.15)  # sample points along the direction of travel of the foot, m
++    progress_relief: float = 0.0  # > 0 (m): the progress term counts only where the height scan around the robot is not flat (max - min above this)
+     w_progress: float = 0.0  # > 0: linear reward of the root speed along the reference travel direction, capped at the reference's speed (the terrain task turns it on: config.EnvCfg.progress_weight)
+ 
+     @property
+@@ -100,6 +101,7 @@ def tracking_reward_terms(
+     leg_side: torch.Tensor | None = None,  # (B,) long: 0 = left, 1 = right (value irrelevant where leg_weight is 0)
+     leg_weight: torch.Tensor | None = None,  # (B,) share of the foot's own terrain height in the lift of each body
+     foot_index: torch.Tensor | None = None,  # (2,) tracked-body indices of the left / right foot
++    progress_gate: torch.Tensor | None = None,  # (N,) 0 / 1: where the progress term counts (None = everywhere)
+ ) -> dict[str, torch.Tensor]:
+     """Per-term weighted, dt-scaled rewards (N,) plus 'total'.
+ 
+@@ -157,6 +159,8 @@ def tracking_reward_terms(
+         speed_ref = v_ref.norm(dim=-1)
+         along = (robot_body_lin_vel_w[..., anchor_index, :2] * v_ref).sum(-1) / speed_ref.clamp_min(1e-3)
+         terms["progress"] = dt * cfg.w_progress * torch.minimum(along, speed_ref)  # no bonus for going faster than the reference
++        if progress_gate is not None:
++            terms["progress"] = terms["progress"] * progress_gate.detach()
+     else:
+         terms["progress"] = zero_n
+     total = terms["motion_global_root_pos"]
+diff --git a/src/supermimic/envs/tracking_env_cfg.py b/src/supermimic/envs/tracking_env_cfg.py
+index 7cb8816..0907876 100644
+--- a/src/supermimic/envs/tracking_env_cfg.py
++++ b/src/supermimic/envs/tracking_env_cfg.py
+@@ -112,6 +112,7 @@ class SuperMimicEnvCfgArgs:
+     terrain: TerrainArgs | None = None
+     terrain_max_init_level: int | None = 0  # rows an env may start on (0 = everyone starts on the easiest row; None = any row)
+     terrain_clip_regex: str = r"^(walk|run|sprint)"  # clips that may start on a non-flat tile
++    terrain_flat_hard_boost: float = 1.0  # sampling weight, on flat tiles, of the clips that never start on a non-flat tile
+     # Contact buffers per env. The flat task uses 35 / 250; on box and height-field terrain a foot can touch several
+     # geoms at once (mjlab's G1 rough-terrain task: nconmax 70, ccd_iterations 500).
+     terrain_nconmax: int = 70
+@@ -191,7 +192,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
+             clip_end_norm=a.sampler_clip_end_norm,
+             compact_library=a.compact_library,
+             debug_vis=a.debug_vis,
+-            **({"terrain_task": True, "terrain_clip_regex": a.terrain_clip_regex} if a.terrain is not None else {}),
++            **({"terrain_task": True, "terrain_clip_regex": a.terrain_clip_regex, "flat_hard_boost": a.terrain_flat_hard_boost} if a.terrain is not None else {}),
+             **a.extra_command_kwargs,
+         )
+     }
+diff --git a/src/supermimic/imagination/compiled.py b/src/supermimic/imagination/compiled.py
+index fa0c656..4f69801 100644
+--- a/src/supermimic/imagination/compiled.py
++++ b/src/supermimic/imagination/compiled.py
+@@ -48,7 +48,11 @@ class ImagStep:
+             ground_fn = self.wm.ground_fn(origin)
+         else:
+             scan_next, lift, ground_fn = None, None, None
+-        terms = self.wm.heads.reward(s_next, a, a_prev, ref, bodies, base_lift=lift, ground_fn=ground_fn)
++        relief = self.wm.heads.reward_cfg.progress_relief
++        # Progress is only asked for near uneven terrain (stopping in front of stairs is the failure it guards against);
++        # on flat ground it only pulled the flat-ground score down (line T1 / T2, 2026-11-15).
++        gate = ((scan_next.amax(-1) - scan_next.amin(-1)) > relief).float() if (scan is not None and relief > 0) else None
++        terms = self.wm.heads.reward(s_next, a, a_prev, ref, bodies, base_lift=lift, ground_fn=ground_fn, progress_gate=gate)
+         r = terms["total"]
+         term_vec = torch.stack([terms[k] for k in REWARD_TERM_NAMES], dim=0)  # (10, n)
+         logits = self.wm.termination_logits(s_next, ref, lift)
+diff --git a/src/supermimic/training/loop.py b/src/supermimic/training/loop.py
+index a4345bb..a2a0ba0 100644
+--- a/src/supermimic/training/loop.py
++++ b/src/supermimic/training/loop.py
+@@ -102,6 +102,7 @@ class Trainer:
+                 terrain=cfg.env.terrain if cfg.env.terrain_task else None,
+                 terrain_max_init_level=cfg.env.terrain_max_init_level,
+                 terrain_clip_regex=cfg.env.terrain_clip_regex,
++                terrain_flat_hard_boost=cfg.env.flat_hard_boost,
+                 seed=cfg.seed + 1000 * self.rank,
+             ),
+             device=self.device,
+@@ -126,6 +127,7 @@ class Trainer:
+             self.wm.set_terrain(self.command.terrain)
+             heads.reward_cfg.w_foot_clearance = cfg.env.foot_clearance_weight
+             heads.reward_cfg.w_progress = cfg.env.progress_weight
++            heads.reward_cfg.progress_relief = cfg.env.progress_relief
+             if cfg.policy.scan_mode != "none":
+                 self.actor_scan = ActorScan(env, self.command.terrain, noise=cfg.env.scan_noise if cfg.env.obs_noise else 0.0)
+             if cfg.policy.scan_mode == "latent" and cfg.scan_encoder is not None:
+diff --git a/src/supermimic/world_model/heads.py b/src/supermimic/world_model/heads.py
+index a118660..c7fd25d 100644
+--- a/src/supermimic/world_model/heads.py
++++ b/src/supermimic/world_model/heads.py
+@@ -126,13 +126,14 @@ class AnalyticHeads:
+             "root_quat": out["quat"][..., self.root_fk_index, :],
+         }
+ 
+-    def reward(self, s_next: torch.Tensor, action: torch.Tensor, prev_action: torch.Tensor, ref: ReferenceFrame, bodies=None, base_lift=None, ground_fn=None):
++    def reward(self, s_next: torch.Tensor, action: torch.Tensor, prev_action: torch.Tensor, ref: ReferenceFrame, bodies=None, base_lift=None, ground_fn=None, progress_gate=None):
+         """Reward r_{t+1} of reaching s_next (= s_{t+1}) under target frame g_t. Returns dict with 'total'.
+         ``base_lift`` / ``ground_fn``: terrain (see tracking_reward_terms); None on flat ground."""
+         b = bodies if bodies is not None else self.robot_bodies(s_next)
+         return tracking_reward_terms(
+             base_lift=base_lift,
+             ground_fn=ground_fn,
++            progress_gate=progress_gate,
+             leg_side=self.leg_side,
+             leg_weight=self.leg_weight,
+             foot_index=self.foot_index,
+-- 
+2.43.0
+

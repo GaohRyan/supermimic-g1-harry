@@ -1,0 +1,52 @@
+.DS_Store
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+.secrets/
+*.key
+*.pem
+credentials*
+data/
+runs/
+artifacts/
+logs/
+*.pt
+*.npz
+*.tar.gz
+# Independent third-party source snapshots are pinned by projects/*/project.json.
+# Keep the existing Cuboi submodule; do not vendor these nested repositories.
+upstream/supermimic_vibed/
+upstream/supermimic-reproduce/
+upstream/allmimic/
+
+# Third-party snapshots are pinned by manifest (projects/*/project.json), not committed; Cuboi is a submodule.
+upstream/*
+!upstream/SuperMimic-Reproduced
+# Variant working copies are nested git repositories and are not committed; only the patch series and variant.json are.
+variants/*/*/
+!variants/*/*.patches/
+# Restricted data and media: LAFAN1 / BONES-SEED and videos derived from them may not be redistributed.
+*.mp4
+*.mov
+*.webm
+*.gif
+*.bvh
+*.pkl
+*.h5
+*.safetensors
+*.ckpt
+# Paper PDFs and full-text extracts stay local; the repository only keeps links.
+docs/handoff/*/sources/
+*.pdf
+tmp/
+wandb/
+.claude/settings.local.json
+
+# local stub for CPU-only offline tools (built by tools/offline/setup_offline_env.sh)
+tools/offline/.mjlab_stub/

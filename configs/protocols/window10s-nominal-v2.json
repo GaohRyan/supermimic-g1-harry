@@ -1,0 +1,58 @@
+{
+ "schema_version": 1,
+ "max_reward_per_step": 0.1,
+ "init": "first frame of clip (forced_frame=clip_start)",
+ "policy": "deterministic, action noise 0",
+ "obs_noise": false,
+ "reset_noise": false,
+ "domain_randomization": false,
+ "foot_friction": 1.0,
+ "nominal_env": "fresh env built with DR disabled; friction/COM/encoder bias read back at runtime",
+ "auto_reset": false,
+ "termination_terms": [
+  "time_out",
+  "clip_end",
+  "root_height(0.25)",
+  "root_tilt(0.8)"
+ ],
+ "physical_failure_terms": [
+  "root_height",
+  "root_tilt"
+ ],
+ "report": [
+  "reward_sum",
+  "planned_steps",
+  "executed_steps",
+  "termination_reason",
+  "completed",
+  "physical_failure",
+  "finite"
+ ],
+ "aggregates": [
+  "macro_mean",
+  "time_weighted_mean",
+  "n_completed",
+  "n_physical_failures"
+ ],
+ "no_cherry_picking": true,
+ "protocol_id": "cuboi-g1/window10s-nominal-v2",
+ "unit": "fixed 10 s windows (500 control steps) tiled from each clip start, non-overlapping, last partial window dropped; each window starts from the reference state at its first frame",
+ "denominator": "planned_steps = 500 per window",
+ "completed": "window reaches its 500th step without physical termination",
+ "implementation": null,
+ "status": "frozen definition; implementation pending (needed before tier C acceptance)",
+ "extra_metrics": {
+  "per_body_errors": [
+   "pelvis",
+   "torso_link"
+  ],
+  "components": [
+   "xy_m",
+   "yaw_deg",
+   "height_m"
+  ],
+  "whole_body": "mean tracked-body position error (m) over the 14 TRACKED_BODIES, world frame and root-relative",
+  "aggregation": "per clip: mean over alive steps and value at fixed times; alive-only means reported together with executed_steps to expose survival bias"
+ },
+ "supersedes_for_new_runs": "cuboi-g1/window10s-nominal-v1 (kept unchanged; used by tier A)"
+}

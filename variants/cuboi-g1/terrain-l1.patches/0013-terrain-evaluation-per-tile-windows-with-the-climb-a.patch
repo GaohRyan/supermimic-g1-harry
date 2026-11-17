@@ -1,0 +1,468 @@
+From 318d44262d6ad5b19b51800791ed92bbf487578c Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:00:45 -0500
+Subject: [PATCH 13/19] terrain: evaluation (per-tile windows with the climb
+ actually done), scan for the policy in every eval script, box-only terrain by
+ default
+
+- supermimic/eval/terrain_eval.py: one fixed-length window per env on chosen tiles; not fallen, completed with the
+  climb done (>= 70 % of the reference path's height change when the path crosses at least two risers), fixed-
+  denominator return, progress. The same loop runs under mjlab (scripts/eval_terrain.py) and in the plain-MuJoCo
+  stand-in of the main repository.
+- sensor tests: flat-ground scan (--scan flat), scaled relief (--scan-relief).
+- eval_fullclip_traj / eval_push / benchmark / play / record_rollout / diag_drift give a scan policy the flat-ground
+  scan on the plane.
+- curriculum: a motion bin no flat env has visited yet is measured against the mean flat-tile reward.
+- reset placement: sole sample points cover the capsule radius.
+- terrain: slope and rough height-field tiles off by default (in plain MuJoCo foot capsules behave differently on a
+  flat height field than on the flat box tile); stairs up / down / uneven + flat.
+- tests: lifts, reset placement, origins, actor scan, checkpoint and optimizer expansion, curriculum rules; conftest
+  with stand-ins so that they run without the mjlab runtime; the stale recorder test fixed.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ scripts/diag_drift.py                 |   5 +-
+ scripts/eval_fullclip_traj.py         |   5 +-
+ scripts/eval_push.py                  |   5 +-
+ scripts/eval_terrain.py               | 116 ++++++++++++++++++++++++++
+ scripts/media/record_rollout.py       |   5 +-
+ scripts/play.py                       |   9 +-
+ src/supermimic/eval/benchmark.py      |   5 +-
+ src/supermimic/eval/terrain_eval.py   | 105 +++++++++++++++++++++++
+ src/supermimic/terrain/actor_scan.py  |  17 ++++
+ src/supermimic/terrain/terrain_cfg.py |  14 ++--
+ 10 files changed, 273 insertions(+), 13 deletions(-)
+ create mode 100644 scripts/eval_terrain.py
+ create mode 100644 src/supermimic/eval/terrain_eval.py
+
+diff --git a/scripts/diag_drift.py b/scripts/diag_drift.py
+index 1b6bd94..e856516 100644
+--- a/scripts/diag_drift.py
++++ b/scripts/diag_drift.py
+@@ -41,6 +41,9 @@ def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] |
+         sampling_mode="start", record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"), goal_contract=cfg["env"].get("goal_contract", "cuboi"),
+     )
+     env = make_env(args, device=device)
++    from supermimic.terrain.actor_scan import actor_scan_for
++
++    scan_fn = actor_scan_for(policy, env)  # a terrain policy on the flat plane is shown the flat-ground scan
+     try:
+         cmd = env.command_manager.get_term("motion")
+         lib = cmd.library
+@@ -89,7 +92,7 @@ def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] |
+             sum_w_world += ew_w * a
+             sum_w_aligned += ew_a * a
+             steps += a
+-            act = policy(obs["policy"], obs["goal"])
++            act = policy(obs["policy"], obs["goal"], scan=scan_fn() if scan_fn is not None else None)
+             obs, _, term, tout, _ = env.step(act)
+             done = (term | tout) & active
+             failed |= term & active
+diff --git a/scripts/eval_fullclip_traj.py b/scripts/eval_fullclip_traj.py
+index 791da2f..6fb00bb 100644
+--- a/scripts/eval_fullclip_traj.py
++++ b/scripts/eval_fullclip_traj.py
+@@ -157,8 +157,11 @@ def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path =
+         REF.append(lib.ref_qpos_qvel(cmd.frame)[0].cpu().numpy())
+         FR.append(cmd.frame.cpu().numpy())
+         term_steps = np.full(n, -1)
++        from supermimic.terrain.actor_scan import actor_scan_for
++
++        scan_fn = actor_scan_for(policy, env)  # a terrain policy on the flat plane is shown the flat-ground scan
+         while alive.any():
+-            a = policy(obs["policy"], obs["goal"])
++            a = policy(obs["policy"], obs["goal"], scan=scan_fn() if scan_fn is not None else None)
+             obs, rew, term, tout, _ = env.step(a)
+             ACL.append(a.cpu().numpy())
+             AEX.append(act_term.executed_raw.clone().cpu().numpy())
+diff --git a/scripts/eval_push.py b/scripts/eval_push.py
+index 4003c65..dcf1fc2 100644
+--- a/scripts/eval_push.py
++++ b/scripts/eval_push.py
+@@ -64,6 +64,9 @@ def main(ckpt: Path, speeds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), num_envs:
+     make_tpose_clip(tmp)
+     args = SuperMimicEnvCfgArgs(npz_files=[str(tmp)], num_envs=num_envs, action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False, sampling_mode="start", record_transitions=False, episode_length_s=1e5, future_frames=cfg["env"]["future_frames"], anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"), goal_contract=cfg["env"].get("goal_contract", "cuboi"), seed=0)
+     env = make_env(args, device=device)
++    from supermimic.terrain.actor_scan import actor_scan_for
++
++    scan_fn = actor_scan_for(policy, env)  # a terrain policy on the flat plane is shown the flat-ground scan
+     robot = env.scene["robot"]
+     cmd = env.command_manager.get_term("motion")
+     dt = env.step_dt
+@@ -81,7 +84,7 @@ def main(ckpt: Path, speeds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), num_envs:
+                 v[:, 1] += speed * torch.sin(ang)
+                 robot.write_root_link_velocity_to_sim(v)
+                 pushed = True
+-            act = policy(obs["policy"], obs["goal"])
++            act = policy(obs["policy"], obs["goal"], scan=scan_fn() if scan_fn is not None else None)
+             obs, rew, term, tout, _ = env.step(act)
+             fallen |= term
+             if pushed:
+diff --git a/scripts/eval_terrain.py b/scripts/eval_terrain.py
+new file mode 100644
+index 0000000..7f06570
+--- /dev/null
++++ b/scripts/eval_terrain.py
+@@ -0,0 +1,116 @@
++"""Terrain evaluation: one fixed-length window per env on chosen tiles (terrain type x level) of the training terrain.
++
++  * the terrain is rebuilt from the checkpoint's config (same generator arguments and seed as in training);
++  * `--per-tile` envs per tile, each started at a locomotion-clip frame drawn uniformly, placed with the training
++    reset placement, no reset noise; deterministic policy, no observation / action noise, no domain randomisation
++    (foot friction 1.0); the level curriculum is off, an env stays on its tile;
++  * per tile: share not fallen, share completed with the climb actually done, tracking return with a fixed
++    denominator, progress along the reference (supermimic/eval/terrain_eval.py).
++
++Sensor tests for a policy with a height-scan input:
++  --scan flat            the actor is shown flat ground everywhere (how much does it use the scan?)
++  --scan-relief 0.9      every height difference in the actor's scan is scaled (a 20 cm riser looks like 18 cm)
++
++Output: <out>/results.json. The checkpoint is loaded with weights_only=True.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import pathlib
++import time
++from pathlib import Path
++
++import torch
++import tyro
++
++from supermimic.envs.mdp.motion_library import discover_npz
++from supermimic.envs.tracking_env_cfg import SuperMimicEnvCfgArgs, make_env_cfg
++from supermimic.eval.terrain_eval import format_rows, run_tile_windows, tile_list
++from supermimic.policy.nets import Policy, PolicyCfg
++from supermimic.terrain.actor_scan import actor_scan_for, relief_scaled
++from supermimic.terrain.terrain_cfg import TerrainArgs
++
++
++def sha256(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        for b in iter(lambda: f.read(1 << 20), b""):
++            h.update(b)
++    return h.hexdigest()
++
++
++@torch.no_grad()
++def main(ckpt: Path, out: Path, npz_dir: Path = Path("data/npz/lafan1"), device: str = "cuda:0", types: tuple[str, ...] = ("flat", "stairs_up", "stairs_down", "stairs_random", "slope", "rough"),
++         levels: tuple[int, ...] = (0, 3, 6, 9), per_tile: int = 64, seconds: float = 10.0, scan: str = "terrain", scan_relief: float = 1.0, seed: int = 0,
++         heightfields: bool = False) -> None:
++    """heightfields: add the slope and rough height-field tiles to the terrain although the run was trained without them
++    (to measure how the simulator's height-field contact compares with the flat box tile)."""
++    assert scan in ("terrain", "flat"), scan
++    t0 = time.time()
++    torch.serialization.add_safe_globals([pathlib.PosixPath])
++    ck = torch.load(ckpt, map_location=device, weights_only=True)
++    cfg = ck["config"]
++    pc = cfg["policy"]
++    policy = Policy(PolicyCfg(**{k: (tuple(v) if isinstance(v, list) else v) for k, v in pc.items()})).to(device)
++    policy.load_state_dict(ck["policy"])
++    policy.eval()
++    env_cfg_saved = cfg["env"]
++    targs = TerrainArgs(**{k: (tuple(v) if isinstance(v, list) else v) for k, v in env_cfg_saved.get("terrain", {}).items()}) if env_cfg_saved.get("terrain") else TerrainArgs()
++    if heightfields:
++        targs.p_slope, targs.p_rough = max(targs.p_slope, 0.05), max(targs.p_rough, 0.05)
++    present = {"flat": targs.p_flat, "stairs_up": targs.p_stairs_up, "stairs_down": targs.p_stairs_down, "stairs_random": targs.p_random_stairs, "slope": targs.p_slope, "rough": targs.p_rough}
++    types = tuple(t for t in types if present.get(t, 0) > 0)  # tile types this terrain has
++    files = [str(f) for f in discover_npz(npz_dir)]
++    n = per_tile * len(types) * len(levels)
++    args = SuperMimicEnvCfgArgs(
++        npz_files=files, num_envs=n, future_frames=env_cfg_saved["future_frames"], episode_length_s=seconds, action_noise_std=0.0, obs_noise=False, reset_noise=False,
++        domain_randomization=False, sampling_mode="return", record_transitions=False, seed=seed, anchor_obs=env_cfg_saved.get("anchor_obs", False),
++        anchor_obs_mode=env_cfg_saved.get("anchor_obs_mode", "full"), goal_contract=env_cfg_saved.get("goal_contract", "cuboi"), sampler_clip_end_norm=True,
++        terrain=targs, terrain_max_init_level=None, terrain_clip_regex=env_cfg_saved.get("terrain_clip_regex", r"^(walk|run|sprint)"),
++        extra_command_kwargs={"terrain_curriculum": False},
++    )
++    from mjlab.envs import ManagerBasedRlEnv
++    from mjlab.utils.torch import configure_torch_backends
++
++    configure_torch_backends()
++    env = ManagerBasedRlEnv(make_env_cfg(args), device=device)
++    try:
++        cmd = env.command_manager.get_term("motion")
++        ent = cmd.terrain_entity
++        tiles = tile_list(cmd.terrain_names, list(types), list(levels))
++        tile_of = torch.arange(n, device=device) // per_tile
++        ent.terrain_types[:] = torch.tensor([tiles[i][0] for i in tile_of.tolist()], device=device)
++        ent.terrain_levels[:] = torch.tensor([tiles[i][1] for i in tile_of.tolist()], device=device)
++        ent.env_origins[:] = ent.terrain_origins[ent.terrain_levels, ent.terrain_types]
++        obs, _ = env.reset()
++        scan_fn = actor_scan_for(policy, env, None if scan == "flat" else cmd.terrain)
++        if scan_fn is not None and scan_relief != 1.0:
++            scan_fn = relief_scaled(scan_fn, scan_relief)
++
++        def step(action):
++            o, rew, term, tout, _ = env.step(action)
++            return o, rew, term, tout
++
++        res = run_tile_windows(cmd, step, obs, policy, scan_fn, tile_of, tiles, int(env.max_episode_length), targs)
++        out.mkdir(parents=True, exist_ok=True)
++        report = {
++            "schema_version": 1, "protocol_id": "cuboi-g1/terrain-window-nominal-v1", "checkpoint": str(ckpt), "checkpoint_sha256": sha256(ckpt),
++            "checkpoint_meta": {"iteration": ck.get("iteration"), "num_updates": ck.get("num_updates")}, "policy_scan_mode": policy.cfg.scan_mode,
++            "scan_fed": scan, "scan_relief": scan_relief, "terrain_args": vars(targs), "per_tile": per_tile, "seconds": seconds, "seed": seed,
++            "env_args": {k: (vars(v) if k == "terrain" else v) for k, v in vars(args).items() if k != "npz_files"},
++            "tiles": res["tiles"], "wall_seconds": time.time() - t0, "torch": torch.__version__,
++        }
++        (out / "results.json").write_text(json.dumps(report, indent=1, default=str))
++        torch.save(res["per_env"], out / "per_env.pt")
++        print(format_rows(res["tiles"]))
++        stairs = [r for r in res["tiles"] if "stairs" in r["type"]]
++        if stairs:
++            print("terrain_summary", json.dumps({"stairs_not_fallen": sum(r["not_fallen"] for r in stairs) / len(stairs), "stairs_completed_with_climb": sum(r["completed_with_climb"] for r in stairs) / len(stairs)}))
++    finally:
++        env.close()
++
++
++if __name__ == "__main__":
++    tyro.cli(main)
+diff --git a/scripts/media/record_rollout.py b/scripts/media/record_rollout.py
+index 2b16212..99df5ab 100644
+--- a/scripts/media/record_rollout.py
++++ b/scripts/media/record_rollout.py
+@@ -35,6 +35,9 @@ def main(ckpt: Path, clips: list[str], npz_dir: Path = Path("data/npz/bones_seed
+         record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"), goal_contract=cfg["env"].get("goal_contract", "cuboi"),
+     )
+     env = make_env(args, device=device)
++    from supermimic.terrain.actor_scan import actor_scan_for
++
++    scan_fn = actor_scan_for(policy, env)  # a terrain policy on the flat plane is shown the flat-ground scan
+     try:
+         cmd = env.command_manager.get_term("motion")
+         lib = cmd.library
+@@ -55,7 +58,7 @@ def main(ckpt: Path, clips: list[str], npz_dir: Path = Path("data/npz/bones_seed
+ 
+         snapshot()
+         while alive.any():
+-            act = policy(obs["policy"], obs["goal"])
++            act = policy(obs["policy"], obs["goal"], scan=scan_fn() if scan_fn is not None else None)
+             obs, rew, term, tout, _ = env.step(act)
+             rew_sum += rew * alive
+             steps += alive.long()
+diff --git a/scripts/play.py b/scripts/play.py
+index d5a1c72..e046503 100644
+--- a/scripts/play.py
++++ b/scripts/play.py
+@@ -28,12 +28,13 @@ from supermimic.eval.benchmark import load_policy_from_checkpoint
+ class _DictPolicy:
+     """Adapts policy(obs_policy, obs_goal) to the viewer's policy(obs) protocol."""
+ 
+-    def __init__(self, policy):
++    def __init__(self, policy, scan_fn=None):
+         self.policy = policy
++        self.scan_fn = scan_fn  # height scan for a terrain policy (None: blind policy)
+ 
+     @torch.no_grad()
+     def __call__(self, obs):
+-        return self.policy(obs["policy"], obs["goal"])
++        return self.policy(obs["policy"], obs["goal"], scan=self.scan_fn() if self.scan_fn is not None else None)
+ 
+ 
+ def main(
+@@ -64,7 +65,9 @@ def main(
+         debug_vis=ghost,
+     )
+     env = RslRlVecEnvWrapper(make_env(args, device=device))
+-    pol = _DictPolicy(policy)
++    from supermimic.terrain.actor_scan import actor_scan_for
++
++    pol = _DictPolicy(policy, actor_scan_for(policy, env.unwrapped))
+     if viewer == "auto":
+         viewer = "native" if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) else "viser"
+     print(f"[INFO] {len(files)} clip(s), {num_envs} env(s), viewer={viewer}")
+diff --git a/src/supermimic/eval/benchmark.py b/src/supermimic/eval/benchmark.py
+index 389e070..f8a63e3 100644
+--- a/src/supermimic/eval/benchmark.py
++++ b/src/supermimic/eval/benchmark.py
+@@ -59,6 +59,9 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0",
+         anchor_obs_mode=anchor_obs_mode,
+     )
+     env = make_env(args, device=device)
++    from supermimic.terrain.actor_scan import actor_scan_for
++
++    scan_fn = actor_scan_for(policy, env)  # a terrain policy on the flat plane is shown the flat-ground scan
+     try:
+         cmd = env.command_manager.get_term("motion")
+         lib = cmd.library
+@@ -79,7 +82,7 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0",
+         results: dict[int, ClipResult] = {}
+         remaining = n_clips
+         while remaining > 0:
+-            act = policy(obs["policy"], obs["goal"])
++            act = policy(obs["policy"], obs["goal"], scan=scan_fn() if scan_fn is not None else None)
+             obs, rew, term, tout, _ = env.step(act)
+             ret_sum += rew
+             term_sum += env.reward_manager.term_rewards
+diff --git a/src/supermimic/eval/terrain_eval.py b/src/supermimic/eval/terrain_eval.py
+new file mode 100644
+index 0000000..0b23c5b
+--- /dev/null
++++ b/src/supermimic/eval/terrain_eval.py
+@@ -0,0 +1,105 @@
++"""Evaluation on the generated terrain: one fixed-length window per env on a chosen tile (terrain type x level).
++
++Pure torch on top of the command term's API, so the same loop runs under mjlab on the GPU (scripts/eval_terrain.py) and
++in the plain-MuJoCo stand-in on a laptop (tools/terrain/local_terrain_run.py of the main repository).
++
++Per tile it reports (docs/plans/terrain-PLAN.md section 5)
++  not_fallen            share of windows without a termination;
++  completed_with_climb  not fallen AND, when the reference path crosses at least two risers, the robot's accumulated
++                        height change is at least 70 % of the reference path's (standing at the foot of the stairs does
++                        not count);
++  norm_return           tracking reward / (0.1 x planned steps): fixed denominator, a fall keeps its zeros;
++  progress_ratio        distance covered along the reference travel direction / distance the reference travelled.
++Heights are the mean terrain height under the body (the base lift), which crosses a step edge smoothly: its accumulated
++change counts every riser once and is not inflated when the root wobbles over an edge.
++"""
++
++from __future__ import annotations
++
++import torch
++
++MAX_STEP_REWARD = 0.1
++CLIMB_SHARE = 0.7
++
++
++def tile_list(terrain_names: list[str], types: list[str], levels: list[int]) -> list[tuple[int, int]]:
++    """[(column, level)] for every requested type x level."""
++    return [(terrain_names.index(t), lv) for t in types for lv in levels]
++
++
++def riser_of(terrain_args, level: int) -> float:
++    lo, hi = terrain_args.step_height_range
++    return lo + (hi - lo) * level / max(terrain_args.num_levels - 1, 1)
++
++
++@torch.no_grad()
++def run_tile_windows(cmd, step, obs, policy, scan_fn, tile_of: torch.Tensor, tiles: list[tuple[int, int]], steps: int, terrain_args) -> dict:
++    """cmd: the motion command term of a terrain env whose envs were placed on their tiles and reset (curriculum off);
++    step(action) -> (obs, reward, terminated, timed_out); scan_fn() -> (N, 187) or None for a blind policy.
++    Only the first episode of every env counts. Returns {"tiles": [per-tile rows], "per_env": {...}}."""
++    from supermimic.kinematics.rotations import heading_yaw
++
++    n = tile_of.numel()
++    dev = tile_of.device
++    alive = torch.ones(n, dtype=torch.bool, device=dev)
++    fell = torch.zeros(n, dtype=torch.bool, device=dev)
++    rsum = torch.zeros(n, device=dev)
++    nsteps = torch.zeros(n, device=dev)
++    planned = cmd.ep_possible.clone().float()  # steps the window can last (the clip may end first)
++    up, down, up_ref, down_ref = (torch.zeros(n, device=dev) for _ in range(4))
++    prog, refd = torch.zeros(n, device=dev), torch.zeros(n, device=dev)
++
++    def heights():
++        ref_pos = cmd._ref.root_pos_w.float() + cmd.origin
++        h_ref = ref_pos[:, 2] - cmd.terrain.scan(ref_pos, heading_yaw(cmd._ref.root_quat_w.float()), cmd.patch_pattern).mean(-1)
++        return cmd.robot_base_lift(), h_ref
++
++    h, h_ref = heights()
++    for _ in range(steps):
++        act = policy(obs["policy"], obs["goal"], scan=scan_fn() if scan_fn is not None else None)
++        obs, rew, term, tout = step(act)
++        rsum += rew * alive
++        nsteps += alive.float()
++        done = (term | tout) & alive
++        fell |= term & alive
++        still = alive & ~done
++        h2, h_ref2 = heights()  # for an env that just ended these are post-reset values: masked out by ``still``
++        for acc, d in ((up, (h2 - h).clamp_min(0)), (down, (h - h2).clamp_min(0)), (up_ref, (h_ref2 - h_ref).clamp_min(0)), (down_ref, (h_ref - h_ref2).clamp_min(0))):
++            acc += d * still
++        h, h_ref = h2, h_ref2
++        prog = torch.where(still, cmd.ep_progress, prog)
++        refd = torch.where(still, cmd.ep_ref_dist, refd)
++        alive = still
++        if not alive.any():
++            break
++    change, change_ref = up + down, up_ref + down_ref
++    rows = []
++    for i, (col, lv) in enumerate(tiles):
++        m = tile_of == i
++        name = cmd.terrain_names[col]
++        riser = riser_of(terrain_args, lv)
++        # A window only has to show a climb when its reference path crosses at least two risers.
++        needs_climb = (change_ref[m] >= 2 * riser) if "stairs" in name else torch.zeros(int(m.sum()), dtype=torch.bool, device=dev)
++        ok = ~fell[m]
++        climbed = change[m] / change_ref[m].clamp_min(1e-6) >= CLIMB_SHARE
++        rows.append({
++            "type": name, "level": int(lv), "riser_cm": round(100 * riser, 1), "windows": int(m.sum()),
++            "not_fallen": float(ok.float().mean()),
++            "completed_with_climb": float((ok & (~needs_climb | climbed)).float().mean()),
++            "norm_return_fixed_denominator": float((rsum[m] / (MAX_STEP_REWARD * planned[m])).mean()),
++            "progress_ratio_mean": float((prog[m] / refd[m].clamp_min(1e-6)).mean()),
++            "ref_height_change_m_mean": float(change_ref[m].mean()),
++            "robot_height_change_m_mean": float(change[m].mean()),
++            "windows_with_stairs_on_the_path": float(needs_climb.float().mean()),
++        })
++    per_env = {"tile": tile_of.cpu(), "fell": fell.cpu(), "steps": nsteps.cpu(), "planned_steps": planned.cpu(), "reward_sum": rsum.cpu(),
++               "height_change": change.cpu(), "ref_height_change": change_ref.cpu(), "progress": prog.cpu(), "ref_distance": refd.cpu()}
++    return {"tiles": rows, "per_env": per_env}
++
++
++def format_rows(rows: list[dict]) -> str:
++    out = [f"{'type':14s} {'riser':>7s} {'n':>4s} {'not fallen':>10s} {'done+climbed':>12s} {'return':>7s} {'progress':>8s} {'height change ref/robot (m)':>27s}"]
++    for r in rows:
++        out.append(f"{r['type']:14s} {r['riser_cm']:5.1f}cm {r['windows']:4d} {r['not_fallen']:10.2f} {r['completed_with_climb']:12.2f} {r['norm_return_fixed_denominator']:7.3f} "
++                   f"{r['progress_ratio_mean']:8.2f} {r['ref_height_change_m_mean']:13.2f} /{r['robot_height_change_m_mean']:6.2f}")
++    return "\n".join(out)
+diff --git a/src/supermimic/terrain/actor_scan.py b/src/supermimic/terrain/actor_scan.py
+index f2103c8..93d34e1 100644
+--- a/src/supermimic/terrain/actor_scan.py
++++ b/src/supermimic/terrain/actor_scan.py
+@@ -35,3 +35,20 @@ class ActorScan:
+         if self.noise > 0:
+             scan = scan + (torch.rand_like(scan) * 2 - 1) * self.noise
+         return scan
++
++
++def relief_scaled(scan_fn, factor: float):
++    """Sensor-mismatch test: the scan the actor gets shows every height difference ``factor`` times as large as it is
++    (0.9: a 20 cm riser looks like 18 cm), around the mean of the scan so that the robot's own height stays right."""
++
++    def fn():
++        scan = scan_fn()
++        mean = scan.mean(-1, keepdim=True)
++        return mean + (scan - mean) * factor
++
++    return fn
++
++
++def actor_scan_for(policy, env, terrain=None, noise: float = 0.0):
++    """ActorScan for a policy with a height-scan input, None for a blind policy. ``terrain`` None = flat ground."""
++    return ActorScan(env, terrain, noise) if policy.cfg.scan_mode != "none" else None
+diff --git a/src/supermimic/terrain/terrain_cfg.py b/src/supermimic/terrain/terrain_cfg.py
+index 8921133..ec7cf2a 100644
+--- a/src/supermimic/terrain/terrain_cfg.py
++++ b/src/supermimic/terrain/terrain_cfg.py
+@@ -1,4 +1,4 @@
+-"""Terrain of the level-1 terrain task: a curriculum grid of flat ground, stairs, slopes and rough ground.
++"""Terrain of the level-1 terrain task: a curriculum grid of flat ground and stairs (optionally slopes and rough ground).
+ 
+ Rows are difficulty levels (0 = easiest), columns are terrain types. The tile is large enough to hold a whole LAFAN1
+ clip without re-centring it: the 40 clips span x [-8.3, 8.1] m and y [-5.0, 5.2] m around the capture origin, and the
+@@ -24,11 +24,15 @@ class TerrainArgs:
+     rough_range: tuple[float, float] = (0.0, 0.06)  # peak-to-peak height noise at the hardest level, m
+     # spawn shares of the columns; flat keeps half of the robots so that the flat-ground skills are not forgotten
+     p_flat: float = 0.5
+-    p_stairs_up: float = 0.15
++    p_stairs_up: float = 0.20
+     p_stairs_down: float = 0.15
+-    p_random_stairs: float = 0.10
+-    p_slope: float = 0.05
+-    p_rough: float = 0.05
++    p_random_stairs: float = 0.15
++    # Height-field tiles are off by default: in plain MuJoCo the foot capsules behave differently on a height field
++    # than on boxes even when it is perfectly flat (open-loop replays drift ~80x faster, the flat-ground policy falls
++    # in 25-50 % of 10 s windows on a level-0 field vs 0-4 % on the flat box tile). Whether MuJoCo-Warp shows the same
++    # has to be measured before they are used for training (docs/plans/terrain-PLAN.md, pitfalls).
++    p_slope: float = 0.0
++    p_rough: float = 0.0
+     seed: int = 0
+ 
+ 
+-- 
+2.43.0
+

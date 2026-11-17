@@ -1,0 +1,250 @@
+From 2123b9b17edd70aa20fcefe11f32853507a0f902 Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:10:45 -0500
+Subject: [PATCH 7/8] opt: AdamW (weight decay 0, identical to the previous
+ Adam) in all trainers; optional Muon on hidden Linear weights
+
+AdamW with weight_decay 0.0 is numerically identical to Adam (test: 25 fresh steps and 10 steps after resuming an Adam
+checkpoint, max parameter difference 0.0); it is the base for later weight-decay experiments. hidden_optimizer=muon
+(wm_trainer / policy_trainer) mirrors the official release: Muon on the Linear weights between the first and the last
+Linear of each Sequential, AdamW elsewhere. Resuming an Adam checkpoint with the Muon layout starts the optimizer fresh.
+---
+ src/supermimic/imagination/policy_trainer.py |  8 +-
+ src/supermimic/training/loop.py              | 13 +++-
+ src/supermimic/training/optim.py             | 82 ++++++++++++++++++++
+ src/supermimic/world_model/wm_trainer.py     |  4 +-
+ tests/test_optim.py                          | 54 +++++++++++++
+ 5 files changed, 155 insertions(+), 6 deletions(-)
+ create mode 100644 src/supermimic/training/optim.py
+ create mode 100644 tests/test_optim.py
+
+diff --git a/src/supermimic/imagination/policy_trainer.py b/src/supermimic/imagination/policy_trainer.py
+index 25b3b1d..47c7690 100644
+--- a/src/supermimic/imagination/policy_trainer.py
++++ b/src/supermimic/imagination/policy_trainer.py
+@@ -28,6 +28,8 @@ class PolicyTrainerCfg:
+     grad_clip_norm: float = 1.0
+     grad_clip_value: float = 0.1
+     critic_lr: float = 2e-4
++    weight_decay: float = 0.0  # AdamW; 0.0 = identical to the plain Adam used before
++    hidden_optimizer: str = "adamw"  # "muon": Muon on the hidden Linear weights (official release), AdamW elsewhere
+     critic_grad_clip: float = 1.0
+     critic_epochs: int = 5
+     critic_minibatches: int = 4
+@@ -43,8 +45,10 @@ class PolicyTrainerCfg:
+ class PolicyTrainer:
+     def __init__(self, wm: WorldModel, policy: Policy, critic: Critic, lib: MotionLibrary, cfg: PolicyTrainerCfg):
+         self.wm, self.policy, self.critic, self.lib, self.cfg = wm, policy, critic, lib, cfg
+-        self.opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr, betas=cfg.betas)
+-        self.critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
++        from supermimic.training.optim import build_optimizer
++
++        self.opt = build_optimizer(policy, cfg.lr, betas=cfg.betas, weight_decay=cfg.weight_decay, hidden=cfg.hidden_optimizer)
++        self.critic_opt = build_optimizer(critic, cfg.critic_lr, weight_decay=cfg.weight_decay, hidden=cfg.hidden_optimizer)
+         from supermimic.imagination.compiled import ImagStep
+ 
+         self.step_fn = ImagStep(wm, lib.default_joint_pos, compile_mode=cfg.compile)
+diff --git a/src/supermimic/training/loop.py b/src/supermimic/training/loop.py
+index db8155c..1be3e2f 100644
+--- a/src/supermimic/training/loop.py
++++ b/src/supermimic/training/loop.py
+@@ -153,9 +153,16 @@ class Trainer:
+         self.wm.load_state_dict(ck["wm"])
+         self.policy.load_state_dict(ck["policy"])
+         self.critic.load_state_dict(ck["critic"])
+-        self.wm_trainer.opt.load_state_dict(ck["wm_opt"])
+-        self.policy_trainer.opt.load_state_dict(ck["policy_opt"])
+-        self.policy_trainer.critic_opt.load_state_dict(ck["critic_opt"])
++        from supermimic.training.optim import load_optimizer_state
++
++        pt, wt = self.cfg.policy_trainer, self.cfg.wm_trainer
++        loaded = {
++            "wm_opt": load_optimizer_state(self.wm_trainer.opt, ck["wm_opt"], weight_decay=wt.weight_decay),
++            "policy_opt": load_optimizer_state(self.policy_trainer.opt, ck["policy_opt"], betas=pt.betas, weight_decay=pt.weight_decay),
++            "critic_opt": load_optimizer_state(self.policy_trainer.critic_opt, ck["critic_opt"], weight_decay=pt.weight_decay),
++        }
++        if not all(loaded.values()):
++            print(f"[WARN] optimizer state not restored (layout changed, starts fresh): {[k for k, v in loaded.items() if not v]}")
+         self.command.bin_return.copy_(ck["bin_return"])
+         self.command.bin_memory.copy_(ck["bin_memory"])
+         self.iteration = ck["iteration"]
+diff --git a/src/supermimic/training/optim.py b/src/supermimic/training/optim.py
+new file mode 100644
+index 0000000..686fca4
+--- /dev/null
++++ b/src/supermimic/training/optim.py
+@@ -0,0 +1,82 @@
++"""Optimizer construction shared by the world-model and policy trainers.
++
++Default: AdamW with weight_decay 0.0, which is numerically identical to the Adam used before (the two differ only in how a
++non-zero weight decay is applied); it is the base for later weight-decay experiments.
++Option hidden="muon" (ablation, as the official SuperMimic release, learners/learner_utils.py::build_optimizers): Muon on
++the Linear weights between the first and the last Linear of every nn.Sequential, AdamW on everything else, same lr.
++"""
++
++from __future__ import annotations
++
++import torch
++import torch.nn as nn
++
++
++class MultiOpt:
++    """Several optimizers behind the small part of the Optimizer interface the trainers use."""
++
++    def __init__(self, opts: list[torch.optim.Optimizer]):
++        self.opts = opts
++
++    @property
++    def param_groups(self) -> list[dict]:
++        return [g for o in self.opts for g in o.param_groups]
++
++    def zero_grad(self, set_to_none: bool = True) -> None:
++        for o in self.opts:
++            o.zero_grad(set_to_none=set_to_none)
++
++    def step(self) -> None:
++        for o in self.opts:
++            o.step()
++
++    def state_dict(self) -> dict:
++        return {"multi": [o.state_dict() for o in self.opts]}
++
++    def load_state_dict(self, sd: dict) -> None:
++        if "multi" not in sd or len(sd["multi"]) != len(self.opts):
++            raise ValueError("optimizer state does not match this optimizer layout")
++        for o, s in zip(self.opts, sd["multi"]):
++            o.load_state_dict(s)
++
++
++def hidden_linear_weights(module: nn.Module) -> list[nn.Parameter]:
++    out = []
++    for seq in module.modules():
++        if isinstance(seq, nn.Sequential):
++            out += [m.weight for m in [m for m in seq if isinstance(m, nn.Linear)][1:-1]]
++    return out
++
++
++def build_optimizer(module: nn.Module, lr: float, betas=(0.9, 0.999), weight_decay: float = 0.0, hidden: str = "adamw"):
++    betas = tuple(betas)
++    if hidden == "adamw":
++        return torch.optim.AdamW(module.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
++    assert hidden == "muon", hidden
++    hid = hidden_linear_weights(module)
++    ids = {id(p) for p in hid}
++    rest = [p for p in module.parameters() if id(p) not in ids]
++    adamw = torch.optim.AdamW(rest, lr=lr, betas=betas, weight_decay=weight_decay)
++    if not hid:
++        return adamw
++    return MultiOpt([adamw, torch.optim.Muon(hid, lr=lr, adjust_lr_fn="match_rms_adamw")])
++
++
++def load_optimizer_state(opt, sd: dict, *, betas=None, weight_decay: float | None = None) -> bool:
++    """Load a checkpointed optimizer state. A state saved by plain Adam loads into AdamW (same buffers); the hyper-parameters
++    of this run are re-applied afterwards (a state dict also carries the old ones). Returns False (state left fresh) when the
++    layouts differ, e.g. an Adam checkpoint resumed with hidden="muon"."""
++    try:
++        opt.load_state_dict(sd)
++    except (ValueError, KeyError, RuntimeError):
++        return False
++    for o in opt.opts if isinstance(opt, MultiOpt) else [opt]:
++        if isinstance(o, torch.optim.AdamW):
++            for g in o.param_groups:
++                if "decoupled_weight_decay" in g:
++                    g["decoupled_weight_decay"] = True
++                if weight_decay is not None:
++                    g["weight_decay"] = weight_decay
++                if betas is not None:
++                    g["betas"] = tuple(betas)
++    return True
+diff --git a/src/supermimic/world_model/wm_trainer.py b/src/supermimic/world_model/wm_trainer.py
+index ac616eb..3e9d3ef 100644
+--- a/src/supermimic/world_model/wm_trainer.py
++++ b/src/supermimic/world_model/wm_trainer.py
+@@ -10,6 +10,7 @@ from supermimic.data.replay_buffer import ReplayBuffer, WindowBatch  # noqa: F40
+ from supermimic.envs.mdp.motion_library import MotionLibrary
+ from supermimic.world_model.heads import ReferenceFrame
+ from supermimic.training.distributed import allreduce_grads
++from supermimic.training.optim import build_optimizer
+ from supermimic.world_model.hard_mining import mine_indices, window_error
+ from supermimic.world_model.world_model import WorldModel
+ 
+@@ -27,6 +28,7 @@ class WMTrainerCfg:
+     hard_ratio: float = 0.0  # fraction of each batch drawn ~ window error ** hard_alpha from the candidates
+     hard_candidates: int = 4  # candidate windows per batch slot (uniform draws)
+     hard_alpha: float = 2.0
++    hidden_optimizer: str = "adamw"  # "muon": Muon on the hidden Linear weights (official release), AdamW elsewhere
+     hard_score_steps: int = 1  # open-loop steps used to score the candidates (1 = one model call per candidate)
+ 
+ 
+@@ -41,7 +43,7 @@ class WorldModelTrainer:
+         self.wm = wm
+         self.lib = lib
+         self.cfg = cfg
+-        self.opt = torch.optim.Adam(wm.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
++        self.opt = build_optimizer(wm, cfg.lr, weight_decay=cfg.weight_decay, hidden=cfg.hidden_optimizer)
+         wm.enable_compile(cfg.compile)
+ 
+     def set_lr(self, lr: float) -> None:
+diff --git a/tests/test_optim.py b/tests/test_optim.py
+new file mode 100644
+index 0000000..c9e4c79
+--- /dev/null
++++ b/tests/test_optim.py
+@@ -0,0 +1,54 @@
++"""AdamW with weight_decay 0 must reproduce the Adam used before (fresh and when resuming an Adam checkpoint); the Muon
++layout must put only the hidden Linear weights on Muon. Pure torch."""
++import copy
++
++import torch
++
++from supermimic.training.optim import MultiOpt, build_optimizer, hidden_linear_weights, load_optimizer_state
++from supermimic.world_model.dynamics import MLP
++
++
++def _train(net, opt, seed, steps):
++    torch.manual_seed(seed)
++    x, y = torch.randn(256, 20), torch.randn(256, 7)
++    for _ in range(steps):
++        loss = ((net(x) - y) ** 2).mean()
++        opt.zero_grad()
++        loss.backward()
++        opt.step()
++
++
++def _diff(a, b):
++    return max((p - q).abs().max().item() for p, q in zip(a.parameters(), b.parameters()))
++
++
++def test_adamw_equals_adam_fresh_and_on_resume():
++    torch.manual_seed(1)
++    a = MLP(20, (64, 64, 64), 7)
++    b = copy.deepcopy(a)
++    oa = torch.optim.Adam(a.parameters(), lr=2e-4, betas=(0.9, 0.95))
++    ob = build_optimizer(b, 2e-4, betas=(0.9, 0.95))
++    _train(a, oa, 0, 25)
++    _train(b, ob, 0, 25)
++    assert _diff(a, b) == 0.0
++    sd = oa.state_dict()
++    na, nb = copy.deepcopy(a), copy.deepcopy(a)
++    o1 = torch.optim.Adam(na.parameters(), lr=2e-4, betas=(0.9, 0.95))
++    o1.load_state_dict(copy.deepcopy(sd))
++    o2 = build_optimizer(nb, 2e-4, betas=(0.9, 0.95))
++    assert load_optimizer_state(o2, copy.deepcopy(sd), betas=(0.9, 0.95), weight_decay=0.0)
++    _train(na, o1, 2, 10)
++    _train(nb, o2, 2, 10)
++    assert _diff(na, nb) == 0.0
++
++
++def test_muon_layout_and_state():
++    m = MLP(20, (64, 64, 64), 7)
++    opt = build_optimizer(m, 2e-4, hidden="muon")
++    assert isinstance(opt, MultiOpt) and [type(o).__name__ for o in opt.opts] == ["AdamW", "Muon"]
++    assert [tuple(p.shape) for p in hidden_linear_weights(m)] == [(64, 64), (64, 64)]
++    _train(m, opt, 0, 5)
++    assert all(torch.isfinite(p).all() for p in m.parameters())
++    adam_sd = torch.optim.Adam(MLP(20, (64, 64, 64), 7).parameters()).state_dict()
++    assert not load_optimizer_state(build_optimizer(MLP(20, (64, 64, 64), 7), 2e-4, hidden="muon"), adam_sd)
++    assert load_optimizer_state(build_optimizer(MLP(20, (64, 64, 64), 7), 2e-4, hidden="muon"), opt.state_dict())
+-- 
+2.43.0
+

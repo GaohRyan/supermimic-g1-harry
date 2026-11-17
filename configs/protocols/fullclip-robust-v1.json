@@ -1,0 +1,63 @@
+{
+ "schema_version": 1,
+ "max_reward_per_step": 0.1,
+ "init": "first frame of clip (forced_frame=clip_start)",
+ "policy": "deterministic policy; action noise 0 unless the variant flag --action-noise-std is given (reported per result)",
+ "obs_noise": true,
+ "reset_noise": true,
+ "domain_randomization": true,
+ "foot_friction": "training DR: foot friction 0.3-1.2 per reset, torso COM offset at startup, encoder bias per reset (Cuboi env defaults)",
+ "nominal_env": "not nominal: training-distribution observation noise, reset noise and domain randomisation are ON; env seed given by --seed (default 0)",
+ "auto_reset": false,
+ "termination_terms": [
+  "time_out",
+  "clip_end",
+  "root_height(0.25)",
+  "root_tilt(0.8)"
+ ],
+ "physical_failure_terms": [
+  "root_height",
+  "root_tilt"
+ ],
+ "report": [
+  "reward_sum",
+  "planned_steps",
+  "executed_steps",
+  "termination_reason",
+  "completed",
+  "physical_failure",
+  "finite"
+ ],
+ "aggregates": [
+  "macro_mean",
+  "time_weighted_mean",
+  "n_completed",
+  "n_physical_failures"
+ ],
+ "no_cherry_picking": true,
+ "protocol_id": "cuboi-g1/fullclip-robust-v1",
+ "unit": "whole clip from first frame to last frame",
+ "denominator": "planned_steps = clip frames (fixed; matches released benchmark steps==frames for completed clips)",
+ "completed": "termination_reason == clip_end",
+ "implementation": "eval_fullclip_traj.py --obs-noise --domain-randomization --reset-noise [--action-noise-std 0.1] [--seed N] (variant commit bf237d7, patch 0007)",
+ "extra_metrics": {
+  "per_body_errors": [
+   "pelvis",
+   "torso_link"
+  ],
+  "components": [
+   "xy_m",
+   "yaw_deg",
+   "height_m"
+  ],
+  "whole_body": "mean tracked-body position error (m) over the 14 TRACKED_BODIES, world frame and root-relative",
+  "aggregation": "per clip: mean over alive steps and value at fixed times; alive-only means reported together with executed_steps to expose survival bias"
+ },
+ "purpose": "same clips and denominator as the nominal protocol, under the perturbations the policy was trained with; answers how much of the nominal score survives noise",
+ "variants_reported": [
+  "seed 0",
+  "seed 1",
+  "seed 0 + action noise std 0.1"
+ ],
+ "frozen_utc": "2026-11-10"
+}

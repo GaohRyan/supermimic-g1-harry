@@ -1,0 +1,109 @@
+{
+ "project_id": "cuboi-g1",
+ "line": "opt",
+ "base_repo": "https://github.com/CuboiLeo/SuperMimic-Reproduced.git",
+ "base_commit": "ba6105349069bf040f1fdad60873d13138d505a2",
+ "parent_variant": "optim",
+ "branch": "opt/terrain-l1",
+ "variant_commit": "eda7fdb1418924c69de44f1d42c003d67041a4b4",
+ "variant_tree": "ec56b7eb38d07c64f831db0af8e8c954b5fb783b",
+ "summary": "optim + terrain task (level 1): generated stairs terrain with a level curriculum, flat-ground references raised onto the terrain (reward, termination, reset placement), 17 x 11 height scan as an input of the world model, the critic and (raw or through a frozen autoencoder) the actor, foot-clearance shaping term, warm start from a flat-ground checkpoint with zero-initialised scan columns (--init-from), per-tile terrain evaluation. With --env.terrain-task off the flat-ground task is unchanged. Checked on a laptop against plain MuJoCo (tools/terrain/local_env.py); not yet run under mjlab / MuJoCo-Warp",
+ "patches": [
+  {
+   "file": "0001-opt-anchor_obs_mode-ori-reference-anchor-orientation.patch",
+   "sha256": "f7def80e68c41091b7629853e92810fc6997bbc94da5614f078880bd0c96e47f",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0002-repro-goal_contract-official-actor-goal-layout-and-a.patch",
+   "sha256": "f7c726f362067394d299fa88d95c1e22e98e09861c6a2e8f9a13c0ce8f773318",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0003-opt-sim-to-real-randomisation-action-delay-armature-.patch",
+   "sha256": "dbfc3b523880205fe2babf49bdf924248469808fc0cbc2e7721c338d715a856d",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0004-opt-reset-sampler-uses-horizon-normalised-return-to-.patch",
+   "sha256": "0a74e994c161becf6fa6fd08d63770aff32e9112c3a0d417fd1661618bd20253",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0005-opt-hard-example-mining-of-world-model-training-wind.patch",
+   "sha256": "9c9b64f20f97d09a2bcf297d94c3361f68da42939c19f4501f6f00ee949f1539",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0006-opt-mine-world-model-windows-by-one-step-error-on-in.patch",
+   "sha256": "67e811f424583be6b675cdfb85dfe20c78445ad7886f89d72546ba6d97cbc956",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0007-opt-AdamW-weight-decay-0-identical-to-the-previous-A.patch",
+   "sha256": "24353801fc3cfd5345ca42496b9fa378e11dcad2294e6251b1e2afa9ba221186",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0008-opt-spell-out-Muon-s-weight-decay-0.1-the-PyTorch-de.patch",
+   "sha256": "91ca11e3a6af4d6ca1a013e38f6b953105e043e3a382ae2bd1cca4110659921d",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0009-terrain-global-height-map-analytic-height-scan-level.patch",
+   "sha256": "c430fbc4bed8c376f55a34f27b6d5960513a44dbcd869d4ec2f8ba8ac571d2a2",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0010-terrain-lifted-references-foot-clearance-scan-inputs.patch",
+   "sha256": "465a73703defb222aff1405f162b695cf3620f30ee23cefea1e9be3b6013b93c",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0011-terrain-height-scan-through-the-imagination-replay-o.patch",
+   "sha256": "b9dd1e26073de2ff84318048925f38fff23150f1d696ddb94cf31029e9157ae6",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0012-terrain-simulator-side-lifted-references-reset-place.patch",
+   "sha256": "70d56c7304437937373110ce75a8d3b167587755e42b72d3be4bd96e1f7acc12",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0013-terrain-evaluation-per-tile-windows-with-the-climb-a.patch",
+   "sha256": "2d60555b656bf731eb19729df0352b748f99c84d9cce85e5ca503fa876259e1b",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0014-terrain-root-height-input-of-the-world-model-measure.patch",
+   "sha256": "90727f7fd347e71375862638a69ec7f71695b36a4edb771277f637ac54edbcd9",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0015-terrain-SM_WARN_OVERFLOW-1-keeps-MuJoCo-Warp-s-conta.patch",
+   "sha256": "81ff51aa2ef684a6f4e9060499176ab54edd260558a0894d6a100c568ab8dd6d",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0016-terrain-progress-term-on-by-default-weight-1.0.patch",
+   "sha256": "f98734f8f178bd70f929b8b716efc2a3da77e6f2ccb2000cded9fb392b3debff",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0017-terrain-warm-start-carries-the-optimizer-state-of-a-.patch",
+   "sha256": "cbb3687af9fda2be52dc3528b99ead6724dabbf2549785ea8e74dac84283ffa5",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0018-terrain-progress-term-only-near-uneven-terrain-hard-.patch",
+   "sha256": "cc1a902adcd9e7e4fd66720a389b75ef7475c767c31fe1622eb4774a0972792f",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0019-eval_terrain-robust-evaluates-under-the-training-tim.patch",
+   "sha256": "960f90fb74ac69db63ed4f70f9dd7a77af71ef5e1bd68eb95cebf7ed7c545887",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  }
+ ],
+ "note_public": "Patch author lines were normalised for publication; variant_tree is unchanged, commit SHAs after git am differ."
+}

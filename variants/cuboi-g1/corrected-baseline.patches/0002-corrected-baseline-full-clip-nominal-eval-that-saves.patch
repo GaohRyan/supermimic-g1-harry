@@ -1,0 +1,249 @@
+From 223b48805094539d65762b53ce02b592c3f0707a Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 16:46:35 -0500
+Subject: [PATCH 2/6] corrected-baseline: full-clip nominal eval that saves
+ real closed-loop trajectories
+
+Fixed planned-step denominator, auto_reset=False to keep the pre-reset terminal
+state, per-step qpos/qvel/actions/rewards/termination terms, weights_only load.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/eval_fullclip_traj.py | 225 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 225 insertions(+)
+ create mode 100644 scripts/eval_fullclip_traj.py
+
+diff --git a/scripts/eval_fullclip_traj.py b/scripts/eval_fullclip_traj.py
+new file mode 100644
+index 0000000..61a78ab
+--- /dev/null
++++ b/scripts/eval_fullclip_traj.py
+@@ -0,0 +1,225 @@
++"""Full-clip closed-loop evaluation that saves the real policy trajectory (corrected-baseline).
++
++Protocol (frozen, see artifacts/projects/cuboi-g1/protocols/fullclip-nominal-v1.json):
++  * one env per clip, every clip starts at its first frame (forced_frame = clip_start);
++  * deterministic policy, action noise 0, no observation noise, reset_noise=False;
++  * domain_randomization=False -> a freshly built nominal env: no COM offset event, no encoder-bias
++    event, foot friction fixed to 1.0 at startup (verified at runtime and written to the report);
++  * auto_reset=False, so the state reached by the last action (s_{T+1}, pre-reset) is returned by
++    step() and recorded; the env is then reset only to satisfy mjlab and is ignored afterwards;
++  * normalised return = reward_sum / (max_reward_per_step * planned_steps) with a FIXED planned
++    denominator (clip length minus one control step, checked against completed clips), never the
++    number of survived steps.
++
++Per step it stores qpos | qvel (env-origin relative, 36 + 35), the clean policy action, the executed
++action, the reward and every termination term. Output: <out>/trajectories.npz + <out>/results.json.
++The checkpoint is loaded with torch.load(weights_only=True) and a single allow-listed global
++(pathlib.PosixPath, used inside the stored config).
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import pathlib
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++import tyro
++
++from supermimic.envs.mdp.motion_library import discover_npz
++from supermimic.envs.state_io import NQ, StateIO
++from supermimic.envs.tracking_env_cfg import FOOT_GEOM_REGEX, SuperMimicEnvCfgArgs, make_env_cfg
++from supermimic.policy.nets import Policy, PolicyCfg
++
++MAX_R = 0.1  # paper reward upper bound per control step (dt * 5)
++
++
++def sha256(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        for b in iter(lambda: f.read(1 << 20), b""):
++            h.update(b)
++    return h.hexdigest()
++
++
++def safe_load_policy(path: Path, device: str) -> tuple[Policy, dict]:
++    torch.serialization.add_safe_globals([pathlib.PosixPath])
++    ck = torch.load(path, map_location=device, weights_only=True)
++    pc = ck["config"]["policy"]
++    pcfg = PolicyCfg(**{k: (tuple(v) if isinstance(v, list) else v) for k, v in pc.items()})
++    policy = Policy(pcfg).to(device)
++    policy.load_state_dict(ck["policy"])
++    policy.eval()
++    meta = {"iteration": ck.get("iteration"), "num_updates": ck.get("num_updates")}
++    return policy, {"config": ck["config"], "meta": meta}
++
++
++def nominal_checks(env) -> dict:
++    """Read back the randomisable model parameters of every env; each check records its own error."""
++    import re
++
++    out: dict = {}
++    robot = env.scene["robot"]
++    m = env.sim.model
++
++    def chk(name, fn):
++        try:
++            out[name] = fn()
++        except Exception as exc:  # report, never crash the eval
++            out[name] = f"unavailable: {type(exc).__name__}: {exc}"[:300]
++
++    chk("event_terms", lambda: {str(k): list(v) for k, v in env.event_manager.active_terms.items()})
++
++    def friction():
++        foot = [i for i, nm in enumerate(robot.geom_names) if re.match(FOOT_GEOM_REGEX, nm)]
++        fr = torch.as_tensor(m.geom_friction[:])[..., robot.indexing.geom_ids[foot].long(), 0]
++        return {"n_foot_geoms": len(foot), "min": float(fr.min()), "max": float(fr.max()), "shape": list(fr.shape)}
++
++    chk("foot_friction", friction)
++
++    def com():
++        bid = robot.indexing.body_ids[robot.body_names.index("torso_link")].long()
++        ipos = torch.as_tensor(m.body_ipos[:])[..., bid, :]
++        ipos = ipos.reshape(-1, 3)
++        return {"spread_across_envs": float((ipos - ipos[:1]).abs().max()), "value_env0": ipos[0].tolist()}
++
++    chk("torso_com", com)
++    chk("encoder_bias_max_abs", lambda: float(robot.data.encoder_bias.abs().max()) if robot.data.encoder_bias.numel() else 0.0)
++    return out
++
++
++@torch.no_grad()
++def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path = Path("data/npz/lafan1"),
++         device: str = "cuda:0", max_steps: int = 20000, data_label: str = "unspecified") -> None:
++    t0 = time.time()
++    files = [str(f) for f in discover_npz(npz_dir, names=clips)] if clips else [str(f) for f in discover_npz(npz_dir)]
++    assert files, f"no npz files in {npz_dir}"
++    policy, ck = safe_load_policy(ckpt, device)
++    cfg = ck["config"]
++    n = len(files)
++    args = SuperMimicEnvCfgArgs(
++        npz_files=files, num_envs=n, future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
++        action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False,
++        sampling_mode="start", record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False),
++    )
++    from mjlab.envs import ManagerBasedRlEnv
++    from mjlab.utils.torch import configure_torch_backends
++
++    configure_torch_backends()
++    env_cfg = make_env_cfg(args)
++    env_cfg.auto_reset = False
++    env = ManagerBasedRlEnv(env_cfg, device=device)
++    try:
++        cmd = env.command_manager.get_term("motion")
++        lib = cmd.library
++        io = StateIO(env)
++        act_term = env.action_manager.get_term("joint_pos")
++        tm = env.termination_manager
++        term_names = list(tm.active_terms)
++        env_clip = torch.arange(n, device=device)
++        cmd.forced_frame[:] = lib.clip_start[env_clip]
++        obs, _ = env.reset()
++        start_frame_ok = bool((cmd.frame == lib.clip_start[env_clip]).all())
++        nominal = nominal_checks(env)
++        lengths = [int(lib.clips[i].length) for i in range(n)]
++        names = [lib.clips[i].name for i in range(n)]
++        planned = np.array([L - 1 for L in lengths])  # control steps from first to last frame
++
++        alive = torch.ones(n, dtype=torch.bool, device=device)
++        rew_sum = torch.zeros(n, dtype=torch.float64, device=device)
++        steps = torch.zeros(n, dtype=torch.long, device=device)
++        reason = [None] * n
++        S, ACL, AEX, R, ALV, FR, TD, REF = [], [], [], [], [], [], [], []
++        S.append(io.read().cpu().numpy())
++        REF.append(lib.ref_qpos_qvel(cmd.frame)[0].cpu().numpy())
++        FR.append(cmd.frame.cpu().numpy())
++        term_steps = np.full(n, -1)
++        while alive.any():
++            a = policy(obs["policy"], obs["goal"])
++            obs, rew, term, tout, _ = env.step(a)
++            ACL.append(a.cpu().numpy())
++            AEX.append(act_term.executed_raw.clone().cpu().numpy())
++            R.append(rew.cpu().numpy())
++            ALV.append(alive.cpu().numpy())
++            TD.append(np.stack([tm.get_term(t).cpu().numpy() for t in term_names], -1))
++            rew_sum += rew.double() * alive
++            steps += alive.long()
++            S.append(io.read().cpu().numpy())  # s_{t+1}; for done envs this is the pre-reset terminal state
++            REF.append(lib.ref_qpos_qvel(cmd.frame)[0].cpu().numpy())  # reference at the same (pre-reset) frame
++            FR.append(cmd.frame.cpu().numpy())
++            done = (term | tout) & alive
++            if done.any():
++                ids = done.nonzero().squeeze(-1)
++                for e in ids.tolist():
++                    fired = [t for t in term_names if bool(tm.get_term(t)[e])]
++                    reason[e] = "+".join(fired) if fired else "unknown"
++                    term_steps[e] = int(steps[e])
++                alive &= ~done
++                env.reset(env_ids=ids)  # required by mjlab when auto_reset=False; env ignored afterwards
++            if int(steps.max()) >= max_steps:
++                for e in alive.nonzero().squeeze(-1).tolist():
++                    reason[e] = "eval_step_cap"
++                    term_steps[e] = int(steps[e])
++                break
++        states = np.stack(S, 1)  # (n, T+1, 71)
++        T = states.shape[1] - 1
++        res = []
++        for i in range(n):
++            ex = int(steps[i])
++            completed = reason[i] is not None and reason[i].split("+") == ["clip_end"] and ex == planned[i]
++            physical_fail = reason[i] is not None and any(r in ("root_height", "root_tilt") for r in reason[i].split("+"))
++            res.append({
++                "clip": names[i], "npz": Path(files[i]).name, "npz_sha256": sha256(Path(files[i])),
++                "frames": lengths[i], "planned_steps": int(planned[i]), "executed_steps": ex,
++                "termination_reason": reason[i], "completed": bool(completed), "physical_failure": bool(physical_fail),
++                "reward_sum": float(rew_sum[i]),
++                "norm_return_fixed_denominator": float(rew_sum[i]) / (MAX_R * int(planned[i])),
++                "norm_return_survived_steps_upstream_style": float(rew_sum[i]) / (MAX_R * max(ex, 1)),
++                "finite": bool(np.isfinite(states[i, : ex + 1]).all()),
++            })
++        out.mkdir(parents=True, exist_ok=True)
++        np.savez_compressed(
++            out / "trajectories.npz", names=np.array(names), qpos=states[..., :NQ].astype(np.float32),
++            qvel=states[..., NQ:].astype(np.float32), frame=np.stack(FR, 1), action_clean=np.stack(ACL, 1),
++            action_executed=np.stack(AEX, 1), reward=np.stack(R, 1), alive_before_step=np.stack(ALV, 1),
++            term_flags=np.stack(TD, 1), term_names=np.array(term_names), executed_steps=steps.cpu().numpy(),
++            planned_steps=planned, ref_qpos=np.stack(REF, 1).astype(np.float32),
++            layout="qpos/qvel[clip, k] = state after k control steps (k=0 initial); index executed_steps is the pre-reset terminal state; entries after it are post-reset filler and must be ignored",
++        )
++        # render_rollout.py-compatible file: frames 0..executed_steps (terminal state included), frozen after.
++        rq, fq = states[..., :NQ].copy(), np.stack(REF, 1)
++        lens = steps.cpu().numpy() + 1
++        for i in range(n):
++            rq[i, lens[i]:] = rq[i, lens[i] - 1]
++            fq[i, lens[i]:] = fq[i, lens[i] - 1]
++        np.savez_compressed(out / "render_input.npz", names=np.array(names), robot_qpos=rq, ref_qpos=fq, lengths=lens,
++                            norm_return=np.array([r["norm_return_fixed_denominator"] for r in res]))
++        nc = sum(r["completed"] for r in res)
++        summary = {
++            "clips": n, "completed": nc, "physical_failures": sum(r["physical_failure"] for r in res),
++            "macro_norm_return_fixed_denominator": float(np.mean([r["norm_return_fixed_denominator"] for r in res])),
++            "time_weighted_norm_return_fixed_denominator": float(sum(r["reward_sum"] for r in res) / (MAX_R * planned.sum())),
++            "all_finite": all(r["finite"] for r in res), "max_recorded_steps": T,
++        }
++        report = {
++            "schema_version": 1, "protocol_id": "cuboi-g1/fullclip-nominal-v1", "data_label": data_label,
++            "checkpoint": str(ckpt), "checkpoint_sha256": sha256(ckpt), "checkpoint_meta": ck["meta"],
++            "env_args": {k: v for k, v in vars(args).items() if k != "npz_files"}, "auto_reset": False,
++            "start_frame_is_clip_start": start_frame_ok, "nominal_checks": nominal, "term_names": term_names,
++            "max_reward_per_step": MAX_R, "summary": summary, "clips": res, "wall_seconds": time.time() - t0,
++            "torch": torch.__version__, "device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
++        }
++        (out / "results.json").write_text(json.dumps(report, indent=1))
++        print(json.dumps(summary))
++        for r in res:
++            print(f"{r['clip']:40s} {r['executed_steps']:6d}/{r['planned_steps']:6d} {r['termination_reason']:14s} "
++                  f"R_fixed={r['norm_return_fixed_denominator']:.3f} R_survived={r['norm_return_survived_steps_upstream_style']:.3f}")
++    finally:
++        env.close()
++
++
++if __name__ == "__main__":
++    tyro.cli(main)
+-- 
+2.43.0
+

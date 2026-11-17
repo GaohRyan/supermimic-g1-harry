@@ -1,0 +1,44 @@
+{
+ "project_id": "cuboi-g1",
+ "line": "opt",
+ "base_repo": "https://github.com/CuboiLeo/SuperMimic-Reproduced.git",
+ "base_commit": "ba6105349069bf040f1fdad60873d13138d505a2",
+ "parent_variant": "sampler-norm",
+ "branch": "opt/wm-hard-mining",
+ "variant_commit": "e7842650604d0a6f14873de7b868008d0a866f1a",
+ "variant_tree": "4c822f98cd70e9cdcd9235fb7bed85735837c282",
+ "summary": "sampler-norm + hard-example mining of world-model training windows (flag wm_trainer.hard_ratio): half of each world-model batch is drawn with probability proportional to the squared one-step error from 4x as many uniform candidates",
+ "patches": [
+  {
+   "file": "0001-opt-anchor_obs_mode-ori-reference-anchor-orientation.patch",
+   "sha256": "4afa287a421e7bbcbcb125e083ee1204b32b86077167b0539aa82ebd2121e529",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0002-repro-goal_contract-official-actor-goal-layout-and-a.patch",
+   "sha256": "b7041532ee7cf03c912aac18dc7c0283c0f6f24ecfd4b2d85ee568da8815a3a6",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0003-opt-sim-to-real-randomisation-action-delay-armature-.patch",
+   "sha256": "7df76719ba9c3f0dc93a2e579414c8c43e1487ccb7666cb73d9af5b2577cf069",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0004-opt-reset-sampler-uses-horizon-normalised-return-to-.patch",
+   "sha256": "ac5bf26b902e9a6b173e287f6f2133ed8618b2e5466d0ad3392803595c3e3cf1",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0005-opt-hard-example-mining-of-world-model-training-wind.patch",
+   "sha256": "85b6da7b9b57e9dc103e0289dfaa3dcf1db098e76a20dc56fb49c01eada9a50d",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0006-opt-mine-world-model-windows-by-one-step-error-on-in.patch",
+   "sha256": "e9a5499fc89417013d61de8af34816948bd712758a4982993c09d3ddd5054044",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  }
+ ],
+ "note_public": "Patch author lines were normalised for publication; variant_tree is unchanged, commit SHAs after git am differ."
+}

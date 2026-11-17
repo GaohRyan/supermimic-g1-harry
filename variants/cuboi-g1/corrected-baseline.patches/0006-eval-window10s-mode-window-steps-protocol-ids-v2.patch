@@ -1,0 +1,102 @@
+From 404633076cc1fd98df7b22d4ddb18e81334cb636 Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 23:43:06 -0500
+Subject: [PATCH 6/6] eval: window10s mode (--window-steps), protocol ids v2
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/eval_fullclip_traj.py | 39 +++++++++++++++++++++++++----------
+ 1 file changed, 28 insertions(+), 11 deletions(-)
+
+diff --git a/scripts/eval_fullclip_traj.py b/scripts/eval_fullclip_traj.py
+index dca6c3d..d81d5e2 100644
+--- a/scripts/eval_fullclip_traj.py
++++ b/scripts/eval_fullclip_traj.py
+@@ -93,13 +93,22 @@ def nominal_checks(env) -> dict:
+ 
+ @torch.no_grad()
+ def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path = Path("data/npz/lafan1"),
+-         device: str = "cuda:0", max_steps: int = 20000, data_label: str = "unspecified") -> None:
++         device: str = "cuda:0", max_steps: int = 20000, data_label: str = "unspecified", window_steps: int = 0) -> None:
++    """window_steps > 0 -> protocol window10s-nominal: non-overlapping windows of window_steps control steps tiled
++    from each clip start (last partial window dropped), one env per window, each started from the exact reference
++    state at its first frame; completed = reaches window_steps without termination."""
+     t0 = time.time()
+     files = [str(f) for f in discover_npz(npz_dir, names=clips)] if clips else [str(f) for f in discover_npz(npz_dir)]
+     assert files, f"no npz files in {npz_dir}"
+     policy, ck = safe_load_policy(ckpt, device)
+     cfg = ck["config"]
+-    n = len(files)
++    n_clips = len(files)
++    if window_steps > 0:
++        lens_np = [int(np.load(f)["joint_pos"].shape[0]) for f in files]
++        win = [(ci, j * window_steps) for ci in range(n_clips) for j in range((lens_np[ci] - 1) // window_steps)]
++    else:
++        win = [(ci, 0) for ci in range(n_clips)]
++    n = len(win)
+     args = SuperMimicEnvCfgArgs(
+         npz_files=files, num_envs=n, future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
+         action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False,
+@@ -119,16 +128,18 @@ def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path =
+         act_term = env.action_manager.get_term("joint_pos")
+         tm = env.termination_manager
+         term_names = list(tm.active_terms)
+-        env_clip = torch.arange(n, device=device)
+-        cmd.forced_frame[:] = lib.clip_start[env_clip]
++        assert all(lib.clips[i].name == Path(files[i]).stem for i in range(n_clips)), "library/file order mismatch"
++        env_clip = torch.tensor([w[0] for w in win], device=device)
++        start_off = torch.tensor([w[1] for w in win], device=device)
++        cmd.forced_frame[:] = lib.clip_start[env_clip] + start_off
+         obs, _ = env.reset()
+-        start_frame_ok = bool((cmd.frame == lib.clip_start[env_clip]).all())
++        start_frame_ok = bool((cmd.frame == lib.clip_start[env_clip] + start_off).all())
+         nominal = nominal_checks(env)
+-        lengths = [int(lib.clips[i].length) for i in range(n)]
+-        names = [lib.clips[i].name for i in range(n)]
++        lengths = [int(lib.clips[c].length) for c, _ in win]
++        names = [lib.clips[c].name + (f"@{o}" if window_steps > 0 else "") for c, o in win]
+         # Fixed denominator = clip length in frames: the author's released benchmark shows steps == frames for every
+         # completed clip under this command/termination ordering. Verified per clip below (steps_match_planned).
+-        planned = np.array([L for L in lengths])
++        planned = np.array([window_steps if window_steps > 0 else L for L in lengths])
+ 
+         alive = torch.ones(n, dtype=torch.bool, device=device)
+         rew_sum = torch.zeros(n, dtype=torch.float64, device=device)
+@@ -161,6 +172,12 @@ def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path =
+                     reason[e] = "+".join(fired) if fired else "unknown"
+                     term_steps[e] = int(steps[e])
+                 alive &= ~done
++            if window_steps > 0:
++                hit = alive & (steps >= window_steps)
++                for e in hit.nonzero().squeeze(-1).tolist():
++                    reason[e] = "window_end"
++                    term_steps[e] = int(steps[e])
++                alive &= ~hit
+             if pending.any():
+                 # mjlab requires an explicit reset of every done env when auto_reset=False; finished envs keep
+                 # replaying their clip as filler and are ignored (alive=False) for all statistics.
+@@ -175,10 +192,10 @@ def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path =
+         res = []
+         for i in range(n):
+             ex = int(steps[i])
+-            completed = reason[i] is not None and reason[i].split("+") == ["clip_end"]
++            completed = reason[i] is not None and reason[i].split("+") == (["window_end"] if window_steps > 0 else ["clip_end"])
+             physical_fail = reason[i] is not None and any(r in ("root_height", "root_tilt") for r in reason[i].split("+"))
+             res.append({
+-                "clip": names[i], "npz": Path(files[i]).name, "npz_sha256": sha256(Path(files[i])),
++                "clip": names[i], "npz": Path(files[win[i][0]]).name, "npz_sha256": sha256(Path(files[win[i][0]])), "start_offset": int(win[i][1]),
+                 "frames": lengths[i], "planned_steps": int(planned[i]), "executed_steps": ex,
+                 "termination_reason": reason[i], "completed": bool(completed), "steps_match_planned": bool(ex == planned[i]), "physical_failure": bool(physical_fail),
+                 "reward_sum": float(rew_sum[i]),
+@@ -211,7 +228,7 @@ def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path =
+             "all_finite": all(r["finite"] for r in res), "max_recorded_steps": T,
+         }
+         report = {
+-            "schema_version": 1, "protocol_id": "cuboi-g1/fullclip-nominal-v1", "data_label": data_label,
++            "schema_version": 1, "protocol_id": ("cuboi-g1/window10s-nominal-v2" if window_steps > 0 else "cuboi-g1/fullclip-nominal-v2"), "data_label": data_label,
+             "checkpoint": str(ckpt), "checkpoint_sha256": sha256(ckpt), "checkpoint_meta": ck["meta"],
+             "env_args": {k: v for k, v in vars(args).items() if k != "npz_files"}, "auto_reset": False,
+             "start_frame_is_clip_start": start_frame_ok, "nominal_checks": nominal, "term_names": term_names,
+-- 
+2.43.0
+

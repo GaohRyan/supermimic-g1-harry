@@ -1,0 +1,462 @@
+From 8546d9dad84d03dbb3cb2f947042ceebc57ae543 Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:50:19 -0500
+Subject: [PATCH 09/19] terrain: global height map + analytic height scan,
+ level-1 terrain config, scan autoencoder
+
+- supermimic/terrain/heightmap.py: rasterises the terrain geoms of the compiled model (upright boxes, height fields,
+  planes) into one height map; nearest-cell lookup without horizontal gradient; 17 x 11 yaw-aligned height scan.
+- supermimic/terrain/terrain_cfg.py: curriculum grid (flat, pyramid stairs up / down, uneven stairs, slope, rough),
+  10 levels, risers 5-20 cm, tread 30 cm, 20 x 14 m tiles (a whole LAFAN1 clip fits without re-centring).
+- supermimic/terrain/scan_ae.py: height-scan autoencoder (encoder to be frozen for the actor).
+- tests/test_heightmap.py: map vs MuJoCo ray casts, lookup sign, scan order, gradient only through the height.
+---
+ src/supermimic/terrain/__init__.py    |   0
+ src/supermimic/terrain/heightmap.py   | 194 ++++++++++++++++++++++++++
+ src/supermimic/terrain/scan_ae.py     |  70 ++++++++++
+ src/supermimic/terrain/terrain_cfg.py |  58 ++++++++
+ tests/test_heightmap.py               |  85 +++++++++++
+ 5 files changed, 407 insertions(+)
+ create mode 100644 src/supermimic/terrain/__init__.py
+ create mode 100644 src/supermimic/terrain/heightmap.py
+ create mode 100644 src/supermimic/terrain/scan_ae.py
+ create mode 100644 src/supermimic/terrain/terrain_cfg.py
+ create mode 100644 tests/test_heightmap.py
+
+diff --git a/src/supermimic/terrain/__init__.py b/src/supermimic/terrain/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/supermimic/terrain/heightmap.py b/src/supermimic/terrain/heightmap.py
+new file mode 100644
+index 0000000..aa2148e
+--- /dev/null
++++ b/src/supermimic/terrain/heightmap.py
+@@ -0,0 +1,194 @@
++"""Global terrain height map and the analytic height scan built on it.
++
++One height map of the whole (static) terrain is rasterised once from the compiled MuJoCo model. Everything that needs
++terrain height reads it from this map: the actor's height scan in the simulator, the same scan on imagined states, the
++world-model / critic terrain input, the terrain-relative reference heights of the reward and the foot-clearance term.
++Using one function everywhere is what keeps "what training sees" equal to "what evaluation sees".
++
++Conventions
++  * heights[j, i] is the terrain height at world (x0 + (i + 0.5) * res, y0 + (j + 0.5) * res)  (cell centres).
++  * lookups take the nearest cell, so vertical risers stay sharp; outside the map the border value is returned.
++  * lookups carry no gradient with respect to the horizontal position (the terrain is treated as locally constant;
++    the derivative at a riser is meaningless). Gradients flow through the body height only.
++  * scan value of a point = z_root - terrain_height(point): positive = ground below the root (mjlab / legged_gym sign).
++
++Pure numpy / torch / mujoco: no mjlab import, usable on a laptop.
++"""
++
++from __future__ import annotations
++
++import hashlib
++from dataclasses import dataclass
++
++import mujoco
++import numpy as np
++import torch
++
++DEFAULT_RESOLUTION = 0.025
++
++
++def _upright(xmat: np.ndarray, tol: float = 1e-6) -> bool:
++    return abs(xmat[2, 2] - 1.0) < tol
++
++
++def rasterize_terrain(model: mujoco.MjModel, resolution: float = DEFAULT_RESOLUTION, terrain_body: str = "terrain", margin: float = 1.0):
++    """Height map of the geoms of ``terrain_body``. Returns (heights float32 [ny, nx], x0, y0).
++
++    Supported exactly: upright boxes (any yaw), height fields, planes. Any other terrain geom raises (add it when a
++    terrain needs it) so that an unsupported shape can never be silently missing from the map.
++    """
++    data = mujoco.MjData(model)
++    mujoco.mj_forward(model, data)
++    bid = model.body(terrain_body).id
++    gids = [g for g in range(model.ngeom) if model.geom_bodyid[g] == bid]
++    if not gids:
++        raise ValueError(f"body {terrain_body!r} has no geoms")
++    lo, hi, base = np.array([np.inf, np.inf]), np.array([-np.inf, -np.inf]), None
++    for g in gids:
++        t, pos = model.geom_type[g], data.geom_xpos[g]
++        if t == mujoco.mjtGeom.mjGEOM_PLANE:
++            base = float(pos[2]) if base is None else max(base, float(pos[2]))
++            continue
++        if t == mujoco.mjtGeom.mjGEOM_BOX:  # exact footprint (the bounding sphere of a long border box is far too large)
++            xm = data.geom_xmat[g].reshape(3, 3)
++            hx, hy = model.geom_size[g][:2]
++            ext = np.array([abs(xm[0, 0]) * hx + abs(xm[0, 1]) * hy, abs(xm[1, 0]) * hx + abs(xm[1, 1]) * hy])
++        elif t == mujoco.mjtGeom.mjGEOM_HFIELD:
++            ext = np.asarray(model.hfield_size[model.geom_dataid[g]][:2], dtype=float)
++        else:
++            ext = np.full(2, float(model.geom_rbound[g]))
++        lo, hi = np.minimum(lo, pos[:2] - ext), np.maximum(hi, pos[:2] + ext)
++    if not np.isfinite(lo).all():  # plane only
++        lo, hi = np.array([-1.0, -1.0]), np.array([1.0, 1.0])
++    x0, y0 = np.floor((lo - margin) / resolution) * resolution
++    nx = int(np.ceil((hi[0] + margin - x0) / resolution))
++    ny = int(np.ceil((hi[1] + margin - y0) / resolution))
++    heights = np.full((ny, nx), -np.inf, dtype=np.float32)
++    if base is not None:
++        heights[:] = base
++
++    def cells(xmin, xmax, ymin, ymax):
++        i0 = max(0, int(np.floor((xmin - x0) / resolution - 0.5)) + 1)
++        i1 = min(nx - 1, int(np.ceil((xmax - x0) / resolution - 0.5)) - 1)
++        j0 = max(0, int(np.floor((ymin - y0) / resolution - 0.5)) + 1)
++        j1 = min(ny - 1, int(np.ceil((ymax - y0) / resolution - 0.5)) - 1)
++        return i0, i1, j0, j1
++
++    for g in gids:
++        t, pos, xmat = model.geom_type[g], data.geom_xpos[g], data.geom_xmat[g].reshape(3, 3)
++        if t == mujoco.mjtGeom.mjGEOM_PLANE:
++            continue
++        if t == mujoco.mjtGeom.mjGEOM_BOX:
++            if not _upright(xmat):
++                raise NotImplementedError(f"tilted box geom {model.geom(g).name!r} is not supported by the height map")
++            hx, hy, hz = model.geom_size[g]
++            top = float(pos[2] + hz)
++            c, s = xmat[0, 0], xmat[1, 0]  # yaw rotation
++            ex, ey = abs(c) * hx + abs(s) * hy, abs(s) * hx + abs(c) * hy
++            i0, i1, j0, j1 = cells(pos[0] - ex, pos[0] + ex, pos[1] - ey, pos[1] + ey)
++            if i1 < i0 or j1 < j0:
++                continue
++            xs = x0 + (np.arange(i0, i1 + 1) + 0.5) * resolution - pos[0]
++            ys = y0 + (np.arange(j0, j1 + 1) + 0.5) * resolution - pos[1]
++            X, Y = np.meshgrid(xs, ys)
++            inside = (np.abs(c * X + s * Y) <= hx) & (np.abs(-s * X + c * Y) <= hy)
++            sub = heights[j0 : j1 + 1, i0 : i1 + 1]
++            sub[inside] = np.maximum(sub[inside], top)
++        elif t == mujoco.mjtGeom.mjGEOM_HFIELD:
++            if not _upright(xmat) or abs(xmat[0, 0] - 1.0) > 1e-6:
++                raise NotImplementedError("rotated height fields are not supported by the height map")
++            hid = model.geom_dataid[g]
++            rx, ry, ez, _ = model.hfield_size[hid]
++            nrow, ncol, adr = model.hfield_nrow[hid], model.hfield_ncol[hid], model.hfield_adr[hid]
++            hf = model.hfield_data[adr : adr + nrow * ncol].reshape(nrow, ncol)  # row = y, col = x, values in [0, 1]
++            i0, i1, j0, j1 = cells(pos[0] - rx, pos[0] + rx, pos[1] - ry, pos[1] + ry)
++            if i1 < i0 or j1 < j0:
++                continue
++            xs = (x0 + (np.arange(i0, i1 + 1) + 0.5) * resolution - (pos[0] - rx)) / (2 * rx) * (ncol - 1)
++            ys = (y0 + (np.arange(j0, j1 + 1) + 0.5) * resolution - (pos[1] - ry)) / (2 * ry) * (nrow - 1)
++            xi, yi = np.clip(np.floor(xs).astype(int), 0, ncol - 2), np.clip(np.floor(ys).astype(int), 0, nrow - 2)
++            fx, fy = np.clip(xs - xi, 0, 1)[None, :], np.clip(ys - yi, 0, 1)[:, None]
++            a, b = hf[np.ix_(yi, xi)], hf[np.ix_(yi, xi + 1)]
++            c2, d = hf[np.ix_(yi + 1, xi)], hf[np.ix_(yi + 1, xi + 1)]
++            val = (a * (1 - fx) + b * fx) * (1 - fy) + (c2 * (1 - fx) + d * fx) * fy
++            sub = heights[j0 : j1 + 1, i0 : i1 + 1]
++            np.maximum(sub, (pos[2] + val * ez).astype(np.float32), out=sub)
++        else:
++            raise NotImplementedError(f"terrain geom type {int(t)} ({model.geom(g).name!r}) is not supported by the height map")
++    if not np.isfinite(heights).all():
++        heights[~np.isfinite(heights)] = float(np.nanmin(heights[np.isfinite(heights)])) if np.isfinite(heights).any() else 0.0
++    return heights, float(x0), float(y0)
++
++
++def terrain_signature(model: mujoco.MjModel, resolution: float, terrain_body: str = "terrain") -> str:
++    """Hash of everything the height map depends on (cache key / checkpoint guard)."""
++    bid = model.body(terrain_body).id
++    g = model.geom_bodyid == bid
++    h = hashlib.sha256()
++    for arr in (model.geom_type[g], model.geom_pos[g], model.geom_quat[g], model.geom_size[g], model.geom_dataid[g], model.hfield_size, model.hfield_data):
++        h.update(np.ascontiguousarray(arr).tobytes())
++    h.update(f"{resolution:.6f}".encode())
++    return h.hexdigest()
++
++
++@dataclass
++class ScanPattern:
++    """Horizontal sample offsets (P, 2) in the yaw-aligned frame of the body the scan is attached to."""
++
++    offsets: torch.Tensor
++    shape: tuple[int, int]
++
++    @classmethod
++    def grid(cls, x_range=(-0.8, 0.8), y_range=(-0.5, 0.5), resolution: float = 0.1, device="cpu") -> "ScanPattern":
++        """17 x 11 = 187 points for the defaults (the legged_gym / ACP planner scan). Order: x-major (x outer, y inner)."""
++        nx = int(round((x_range[1] - x_range[0]) / resolution)) + 1
++        ny = int(round((y_range[1] - y_range[0]) / resolution)) + 1
++        xs = torch.linspace(x_range[0], x_range[1], nx, device=device)
++        ys = torch.linspace(y_range[0], y_range[1], ny, device=device)
++        return cls(torch.stack(torch.meshgrid(xs, ys, indexing="ij"), -1).reshape(-1, 2), (nx, ny))
++
++    def to(self, device) -> "ScanPattern":
++        return ScanPattern(self.offsets.to(device), self.shape)
++
++
++class TerrainMap:
++    def __init__(self, heights: torch.Tensor, x0: float, y0: float, resolution: float):
++        self.heights = heights  # (ny, nx) on the training device
++        self.x0, self.y0, self.res = float(x0), float(y0), float(resolution)
++        self.ny, self.nx = heights.shape
++        self._flat = heights.reshape(-1)
++
++    @classmethod
++    def from_model(cls, model: mujoco.MjModel, resolution: float = DEFAULT_RESOLUTION, device="cpu", terrain_body: str = "terrain") -> "TerrainMap":
++        h, x0, y0 = rasterize_terrain(model, resolution, terrain_body)
++        return cls(torch.as_tensor(h, device=device), x0, y0, resolution)
++
++    @classmethod
++    def flat(cls, device="cpu", height: float = 0.0) -> "TerrainMap":
++        return cls(torch.full((2, 2), float(height), device=device), -1.0e6, -1.0e6, 1.0e6)
++
++    @property
++    def is_flat(self) -> bool:
++        return bool((self.heights == self.heights.flatten()[0]).all())
++
++    @torch.no_grad()
++    def height(self, xy: torch.Tensor) -> torch.Tensor:
++        """Terrain height at world positions xy (..., 2) -> (...). Nearest cell, no gradient."""
++        i = ((xy[..., 0] - self.x0) / self.res).floor().long().clamp_(0, self.nx - 1)
++        j = ((xy[..., 1] - self.y0) / self.res).floor().long().clamp_(0, self.ny - 1)
++        return self._flat[j * self.nx + i]
++
++    def scan(self, root_pos_w: torch.Tensor, yaw: torch.Tensor, pattern: ScanPattern) -> torch.Tensor:
++        """Height scan (..., P): z_root - terrain height at the pattern points placed around the root, yaw aligned.
++        The gradient flows through z_root only."""
++        c, s = torch.cos(yaw).detach()[..., None], torch.sin(yaw).detach()[..., None]
++        ox, oy = pattern.offsets[:, 0], pattern.offsets[:, 1]
++        xy = torch.stack([root_pos_w[..., 0:1].detach() + c * ox - s * oy, root_pos_w[..., 1:2].detach() + s * ox + c * oy], -1)
++        return root_pos_w[..., 2:3] - self.height(xy)
++
++    def state_dict(self) -> dict:
++        return {"heights": self.heights.detach().cpu(), "x0": self.x0, "y0": self.y0, "res": self.res}
++
++    @classmethod
++    def from_state_dict(cls, sd: dict, device="cpu") -> "TerrainMap":
++        return cls(sd["heights"].to(device), sd["x0"], sd["y0"], sd["res"])
+diff --git a/src/supermimic/terrain/scan_ae.py b/src/supermimic/terrain/scan_ae.py
+new file mode 100644
+index 0000000..9b4cfe1
+--- /dev/null
++++ b/src/supermimic/terrain/scan_ae.py
+@@ -0,0 +1,70 @@
++"""Autoencoder of the height scan. The encoder is pre-trained once, then frozen: the actor consumes its latent.
++
++Why a frozen, pre-trained encoder (docs/plans/terrain-PLAN.md, T5): it fixes the interface between perception and the
++actor, so a later depth-camera encoder only has to produce the same latent; and an encoder trained only by the policy
++gradient through the world model has been reported to degrade. The decoder exists for pre-training (and later as the
++reconstruction target of other sensors); it is not used for control.
++
++Input convention: scan = z_root - terrain height at the 17 x 11 pattern points; the network sees (scan - SCAN_OFFSET) /
++SCAN_SCALE, so a standing robot on flat ground is near zero.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import torch
++import torch.nn as nn
++
++SCAN_OFFSET = 0.8
++SCAN_SCALE = 0.25
++
++
++@dataclass
++class ScanAECfg:
++    scan_dim: int = 187
++    latent_dim: int = 32
++    hidden: tuple[int, ...] = (256, 128)
++
++
++def _mlp(dims, last_act: bool = False) -> nn.Sequential:
++    layers: list[nn.Module] = []
++    for i in range(len(dims) - 1):
++        layers.append(nn.Linear(dims[i], dims[i + 1]))
++        if i < len(dims) - 2 or last_act:
++            layers.append(nn.ELU())
++    return nn.Sequential(*layers)
++
++
++class ScanEncoder(nn.Module):
++    def __init__(self, cfg: ScanAECfg):
++        super().__init__()
++        self.cfg = cfg
++        self.net = _mlp((cfg.scan_dim, *cfg.hidden, cfg.latent_dim))
++
++    def forward(self, scan: torch.Tensor) -> torch.Tensor:
++        return self.net((scan - SCAN_OFFSET) / SCAN_SCALE)
++
++
++class ScanAE(nn.Module):
++    def __init__(self, cfg: ScanAECfg | None = None):
++        super().__init__()
++        self.cfg = cfg or ScanAECfg()
++        self.encoder = ScanEncoder(self.cfg)
++        self.decoder = _mlp((self.cfg.latent_dim, *reversed(self.cfg.hidden), self.cfg.scan_dim))
++
++    def forward(self, scan: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        z = self.encoder(scan)
++        return self.decoder(z) * SCAN_SCALE + SCAN_OFFSET, z
++
++
++def load_frozen_encoder(path, device="cpu") -> tuple[ScanEncoder, dict]:
++    """Encoder of a pre-trained autoencoder, in eval mode with gradients off. Returns (encoder, metadata)."""
++    ck = torch.load(path, map_location=device, weights_only=True)
++    cfg = ScanAECfg(scan_dim=ck["cfg"]["scan_dim"], latent_dim=ck["cfg"]["latent_dim"], hidden=tuple(ck["cfg"]["hidden"]))
++    enc = ScanEncoder(cfg).to(device)
++    enc.load_state_dict(ck["encoder"])
++    enc.eval()
++    for p in enc.parameters():
++        p.requires_grad_(False)
++    return enc, ck["meta"]
+diff --git a/src/supermimic/terrain/terrain_cfg.py b/src/supermimic/terrain/terrain_cfg.py
+new file mode 100644
+index 0000000..8921133
+--- /dev/null
++++ b/src/supermimic/terrain/terrain_cfg.py
+@@ -0,0 +1,58 @@
++"""Terrain of the level-1 terrain task: a curriculum grid of flat ground, stairs, slopes and rough ground.
++
++Rows are difficulty levels (0 = easiest), columns are terrain types. The tile is large enough to hold a whole LAFAN1
++clip without re-centring it: the 40 clips span x [-8.3, 8.1] m and y [-5.0, 5.2] m around the capture origin, and the
++actor (orientation feedback only) drifts by about 2 m, so a tile is 20 x 14 m with its origin at the tile centre.
++
++Only the terrain sub-modules of mjlab are imported (not the package root), so the same function also runs on a laptop
++through tools/terrain/mjlab_terrain_local.py.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++TILE_SIZE = (20.0, 14.0)
++
++
++@dataclass
++class TerrainArgs:
++    num_levels: int = 10
++    step_height_range: tuple[float, float] = (0.05, 0.20)  # riser: level 0 .. level num_levels-1 (legged_gym: 0.05 .. 0.23)
++    step_width: float = 0.30  # tread (legged_gym: 0.31)
++    slope_range: tuple[float, float] = (0.0, 0.30)  # rad
++    rough_range: tuple[float, float] = (0.0, 0.06)  # peak-to-peak height noise at the hardest level, m
++    # spawn shares of the columns; flat keeps half of the robots so that the flat-ground skills are not forgotten
++    p_flat: float = 0.5
++    p_stairs_up: float = 0.15
++    p_stairs_down: float = 0.15
++    p_random_stairs: float = 0.10
++    p_slope: float = 0.05
++    p_rough: float = 0.05
++    seed: int = 0
++
++
++def make_terrain_generator_cfg(a: TerrainArgs | None = None):
++    from mjlab.terrains.heightfield_terrains import HfPyramidSlopedTerrainCfg, HfRandomUniformTerrainCfg
++    from mjlab.terrains.primitive_terrains import (
++        BoxFlatTerrainCfg,
++        BoxInvertedPyramidStairsTerrainCfg,
++        BoxPyramidStairsTerrainCfg,
++        BoxRandomStairsTerrainCfg,
++    )
++    from mjlab.terrains.terrain_generator import TerrainGeneratorCfg
++
++    a = a or TerrainArgs()
++    sub = {
++        "flat": BoxFlatTerrainCfg(proportion=a.p_flat),
++        # pyramid: the robot meets steps going up towards the centre and down away from it
++        "stairs_up": BoxPyramidStairsTerrainCfg(proportion=a.p_stairs_up, step_height_range=a.step_height_range, step_width=a.step_width, platform_width=2.0),
++        "stairs_down": BoxInvertedPyramidStairsTerrainCfg(proportion=a.p_stairs_down, step_height_range=a.step_height_range, step_width=a.step_width, platform_width=2.0),
++        # every step of this staircase has its own height: the policy cannot rely on a constant riser
++        "stairs_random": BoxRandomStairsTerrainCfg(proportion=a.p_random_stairs, step_height_range=a.step_height_range, step_width=2 * a.step_width, platform_width=2.0, border_width=0.0),
++        "slope": HfPyramidSlopedTerrainCfg(proportion=a.p_slope, slope_range=a.slope_range, platform_width=2.0, horizontal_scale=0.1),
++        "rough": HfRandomUniformTerrainCfg(proportion=a.p_rough, noise_range=a.rough_range, noise_step=0.005, horizontal_scale=0.1, scale_with_difficulty=True),
++    }
++    sub = {k: v for k, v in sub.items() if v.proportion > 0}
++    return TerrainGeneratorCfg(seed=a.seed, curriculum=True, size=TILE_SIZE, border_width=5.0, border_height=1.0, num_rows=a.num_levels,
++                               num_cols=len(sub), color_scheme="height", sub_terrains=sub, difficulty_range=(0.0, 1.0))
+diff --git a/tests/test_heightmap.py b/tests/test_heightmap.py
+new file mode 100644
+index 0000000..cbfd3db
+--- /dev/null
++++ b/tests/test_heightmap.py
+@@ -0,0 +1,85 @@
++"""Terrain height map: rasterisation against MuJoCo ray casts, lookup conventions, height scan. Pure mujoco / torch."""
++import math
++
++import mujoco
++import numpy as np
++import torch
++
++from supermimic.terrain.heightmap import ScanPattern, TerrainMap, rasterize_terrain, terrain_signature
++
++XML = """
++<mujoco>
++  <asset><hfield name="hf" nrow="21" ncol="31" size="3 2 0.5 0.1"/></asset>
++  <worldbody>
++    <body name="terrain">
++      <geom name="floor" type="plane" size="0 0 0.01"/>
++      <geom name="step1" type="box" size="1.0 0.5 0.1" pos="0 0 0.1"/>
++      <geom name="step2" type="box" size="0.5 0.5 0.2" pos="0 0 0.2"/>
++      <geom name="yawed" type="box" size="0.6 0.2 0.15" pos="3 1 0.15" euler="0 0 35"/>
++      <geom name="field" type="hfield" hfield="hf" pos="-5 0 0"/>
++    </body>
++    <body name="other" pos="0 0 3"><geom type="sphere" size="0.2"/></body>
++  </worldbody>
++</mujoco>
++"""
++
++
++def _model():
++    m = mujoco.MjModel.from_xml_string(XML)
++    yy, xx = np.meshgrid(np.linspace(0, 1, 21), np.linspace(0, 1, 31), indexing="ij")
++    m.hfield_data[:] = (0.5 + 0.5 * np.sin(4 * xx) * np.cos(3 * yy)).astype(np.float32).reshape(-1)  # smooth field
++    return m
++
++
++def _ray(model, data, xy):
++    gid = np.zeros(1, dtype=np.int32)
++    group = np.array([1, 0, 0, 0, 0, 0], dtype=np.uint8)
++    out = np.zeros(len(xy))
++    for k, p in enumerate(xy):
++        d = mujoco.mj_ray(model, data, np.array([p[0], p[1], 50.0]), np.array([0, 0, -1.0]), group, 1, model.body("other").id, gid)
++        out[k] = 50.0 - d
++    return out
++
++
++def test_map_matches_ray_casts():
++    model = _model()
++    data = mujoco.MjData(model)
++    mujoco.mj_forward(model, data)
++    res = 0.01
++    h, x0, y0 = rasterize_terrain(model, res)
++    tm = TerrainMap(torch.as_tensor(h), x0, y0, res)
++    rng = np.random.default_rng(0)
++    xy = np.stack([rng.uniform(-7.5, 4.0, 4000), rng.uniform(-1.9, 1.9, 4000)], 1)
++    err = np.abs(tm.height(torch.as_tensor(xy)).numpy() - _ray(model, data, xy))
++    # boxes: exact away from an edge; an edge can be off by at most one cell (the full step) for points within res of it
++    assert np.median(err) < 1e-4
++    assert (err > 0.02).mean() < 0.02, (err > 0.02).mean()
++    # away from every box edge the map is exact up to the bilinear height-field approximation
++    far = (np.abs(xy[:, 0]) > 1.05) & (np.abs(xy[:, 0] - 3) > 0.9) & (xy[:, 0] > -7.9)
++    assert err[far].max() < 0.02, err[far].max()
++
++
++def test_lookup_sign_scan_and_gradient():
++    model = _model()
++    h, x0, y0 = rasterize_terrain(model, 0.01)
++    tm = TerrainMap(torch.as_tensor(h), x0, y0, 0.01)
++    assert abs(tm.height(torch.tensor([[0.0, 0.0]])).item() - 0.4) < 1e-6  # top of step2
++    assert abs(tm.height(torch.tensor([[0.8, 0.0]])).item() - 0.2) < 1e-6  # step1
++    assert abs(tm.height(torch.tensor([[1.5, 0.0]])).item()) < 1e-6  # floor
++    assert tm.height(torch.tensor([[1e4, -1e4]])).isfinite().all()  # outside: clamped to the border
++    pat = ScanPattern.grid()
++    assert pat.offsets.shape == (187, 2) and pat.shape == (17, 11)
++    root = torch.tensor([[1.5, 0.0, 0.79]], requires_grad=True)
++    sc = tm.scan(root, torch.tensor([math.pi]), pat).reshape(17, 11)  # facing -x: the steps are ahead
++    # x-major order: first index = forward offset -0.8 .. 0.8; centre column = y offset 0
++    col = sc[:, 5].detach()
++    assert abs(col[8].item() - 0.79) < 1e-6  # under the root: floor
++    assert abs(col[16].item() - (0.79 - 0.2)) < 1e-6  # 0.8 m ahead: x = 0.7 -> step1 (0.2 high)
++    assert abs(col[0].item() - 0.79) < 1e-6  # behind: floor
++    sc.sum().backward()
++    assert torch.allclose(root.grad, torch.tensor([[0.0, 0.0, 187.0]]))  # gradient through the height only
++    flat = TerrainMap.flat()
++    assert flat.is_flat and torch.allclose(flat.scan(root.detach(), torch.tensor([0.3]), pat), torch.full((1, 187), 0.79))
++    assert terrain_signature(model, 0.01) == terrain_signature(_model(), 0.01) != terrain_signature(model, 0.02)
++    rt = TerrainMap.from_state_dict(tm.state_dict())
++    assert torch.equal(rt.heights, tm.heights) and rt.res == tm.res
+-- 
+2.43.0
+

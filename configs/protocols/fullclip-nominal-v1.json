@@ -1,0 +1,43 @@
+{
+ "schema_version": 1,
+ "max_reward_per_step": 0.1,
+ "init": "first frame of clip (forced_frame=clip_start)",
+ "policy": "deterministic, action noise 0",
+ "obs_noise": false,
+ "reset_noise": false,
+ "domain_randomization": false,
+ "foot_friction": 1.0,
+ "nominal_env": "fresh env built with DR disabled; friction/COM/encoder bias read back at runtime",
+ "auto_reset": false,
+ "termination_terms": [
+  "time_out",
+  "clip_end",
+  "root_height(0.25)",
+  "root_tilt(0.8)"
+ ],
+ "physical_failure_terms": [
+  "root_height",
+  "root_tilt"
+ ],
+ "report": [
+  "reward_sum",
+  "planned_steps",
+  "executed_steps",
+  "termination_reason",
+  "completed",
+  "physical_failure",
+  "finite"
+ ],
+ "aggregates": [
+  "macro_mean",
+  "time_weighted_mean",
+  "n_completed",
+  "n_physical_failures"
+ ],
+ "no_cherry_picking": true,
+ "protocol_id": "cuboi-g1/fullclip-nominal-v1",
+ "unit": "whole clip from first frame to last frame",
+ "denominator": "planned_steps = clip frames (fixed; matches released benchmark steps==frames for completed clips)",
+ "completed": "termination_reason == clip_end",
+ "implementation": "variants/cuboi-g1/corrected-baseline/scripts/eval_fullclip_traj.py @ a508a82"
+}

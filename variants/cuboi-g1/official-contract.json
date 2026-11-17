@@ -1,0 +1,31 @@
+{
+ "project_id": "cuboi-g1",
+ "line": "repro",
+ "base_repo": "https://github.com/CuboiLeo/SuperMimic-Reproduced.git",
+ "base_commit": "ba6105349069bf040f1fdad60873d13138d505a2",
+ "parent_variant": "corrected-baseline",
+ "parent_variant_commit": "bf237d72a4875da6039116a638c1c9086a6bad6b",
+ "branch": "repro/official-contract",
+ "variant_commit": "112ee9563646d4ee3db6c73ba5b9011d9e2889bd",
+ "variant_tree": "54306f0a7b369964526e9e8a50e7804d00ce0e3f",
+ "reference": "HybridRobotics/supermimic @ 5efbf114e11f725c31d83e217be987c13c0e4ce2 (source read, not run)",
+ "summary": "env.goal_contract=official: actor goal = 10 strided frames of joint targets + reference root orientation window (rot6d), anchor body pelvis; defaults keep corrected-baseline behaviour",
+ "not_aligned": [
+  "world-model goal / critic inputs (official feeds rel_pos to the world model)",
+  "termination softness, latent BC weight, WM loss normalisation, optimiser betas",
+  "history length and training schedule (official defaults differ from the paper table)"
+ ],
+ "patches": [
+  {
+   "file": "0001-opt-anchor_obs_mode-ori-reference-anchor-orientation.patch",
+   "sha256": "8c91bc5c9ff03b3d15f316a6aeccfa3d306520c8834f19f69b9fdfbdbeb39d2f",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0002-repro-goal_contract-official-actor-goal-layout-and-a.patch",
+   "sha256": "2e977fcb51f54d41cfafa23dec362f331d58394641697b148f3de0875a38a76b",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  }
+ ],
+ "note_public": "Patch author lines were normalised for publication; variant_tree is unchanged, commit SHAs after git am differ."
+}

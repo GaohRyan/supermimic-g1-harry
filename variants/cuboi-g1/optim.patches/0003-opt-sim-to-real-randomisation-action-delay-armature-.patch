@@ -1,0 +1,415 @@
+From 6ce075d00272c2a0a89836efd08359afe4365673 Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:35:34 -0500
+Subject: [PATCH 3/8] opt: sim-to-real randomisation (action delay; armature,
+ kp, kd, joint damping, friction loss)
+
+Not in the paper or the official release. Two switches, both off by default:
+- env.action_delay_max N: each env executes the action computed d ~ U{0..N} control steps ago (per
+  episode). The replay stores the executed action, so the world model needs no change; imagination
+  feeds it the action from d steps back while reward and observations keep the clean action.
+- env.sim2real_dr: per-env armature scale (startup), kp / kd scale, passive damping and friction loss
+  (reset). The five scalars are appended to the world-model context xi (33 -> 38): the actor only
+  becomes robust to what the world model can vary in imagination.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ scripts/eval_fullclip_traj.py                |  2 +-
+ src/supermimic/config.py                     |  2 +
+ src/supermimic/data/recorder.py              |  6 +-
+ src/supermimic/envs/actions.py               | 20 ++++-
+ src/supermimic/envs/sim2real_dr.py           | 81 ++++++++++++++++++++
+ src/supermimic/envs/sim_context.py           | 10 ++-
+ src/supermimic/envs/tracking_env_cfg.py      | 10 ++-
+ src/supermimic/imagination/compiled.py       |  8 +-
+ src/supermimic/imagination/policy_trainer.py |  3 +-
+ src/supermimic/imagination/rollout.py        | 12 ++-
+ src/supermimic/training/loop.py              | 10 ++-
+ src/supermimic/world_model/world_model.py    |  2 +-
+ 12 files changed, 149 insertions(+), 17 deletions(-)
+ create mode 100644 src/supermimic/envs/sim2real_dr.py
+
+diff --git a/scripts/eval_fullclip_traj.py b/scripts/eval_fullclip_traj.py
+index c95054a..791da2f 100644
+--- a/scripts/eval_fullclip_traj.py
++++ b/scripts/eval_fullclip_traj.py
+@@ -119,7 +119,7 @@ def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path =
+     args = SuperMimicEnvCfgArgs(
+         npz_files=files, num_envs=n, future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
+         action_noise_std=action_noise_std, obs_noise=obs_noise, reset_noise=reset_noise, domain_randomization=domain_randomization,
+-        sampling_mode="start", record_transitions=False, seed=seed, anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"), goal_contract=cfg["env"].get("goal_contract", "cuboi"),
++        sampling_mode="start", record_transitions=False, seed=seed, anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"), goal_contract=cfg["env"].get("goal_contract", "cuboi"), sim2real_dr=bool(cfg["env"].get("sim2real_dr", False)) and domain_randomization, action_delay_max=int(cfg["env"].get("action_delay_max", 0)) if domain_randomization else 0,
+     )
+     from mjlab.envs import ManagerBasedRlEnv
+     from mjlab.utils.torch import configure_torch_backends
+diff --git a/src/supermimic/config.py b/src/supermimic/config.py
+index 58b17c5..b219cb3 100644
+--- a/src/supermimic/config.py
++++ b/src/supermimic/config.py
+@@ -33,6 +33,8 @@ class EnvCfg:
+     future_frames: int = 10
+     compact_library: bool = False
+     anchor_obs: bool = False
++    sim2real_dr: bool = False  # optimisation line: extra dynamics randomisation, xi grows to 38-D
++    action_delay_max: int = 0  # optimisation line: action delay U{0..N} control steps (env and imagination)
+     goal_contract: str = "cuboi"  # "official" = goal layout + anchor body of the official release (needs anchor_obs_mode ori_window)
+     anchor_obs_mode: str = "full"  # with anchor_obs: "full" = position (3) + rot6d (6); "ori" = rot6d (6) only (IMU-observable)
+ 
+diff --git a/src/supermimic/data/recorder.py b/src/supermimic/data/recorder.py
+index 57c0925..454c48f 100644
+--- a/src/supermimic/data/recorder.py
++++ b/src/supermimic/data/recorder.py
+@@ -31,13 +31,13 @@ class ReplayRecorder(RecorderTerm):
+         super().__init__(cfg, env)
+         p = cfg.params
+         self.state_io = StateIO(env)
+-        self.ctx = SimContext(env, p["foot_geom_regex"], p.get("com_body_name", "torso_link"))
++        self.ctx = SimContext(env, p["foot_geom_regex"], p.get("com_body_name", "torso_link"), sim2real_dr=bool(p.get("sim2real_dr", False)))
+         self.command_name = p.get("command_name", "motion")
+         self.action_name = p.get("action_name", "joint_pos")
+         n = env.num_envs
+-        self.buffer = ReplayBuffer(n, int(p["capacity"]), STATE_DIM, 29, XI_DIM, env.device)
++        self.buffer = ReplayBuffer(n, int(p["capacity"]), STATE_DIM, 29, self.ctx.dim, env.device)
+         self.prev_s = torch.zeros(n, STATE_DIM, device=env.device)
+-        self.prev_xi = torch.zeros(n, XI_DIM, device=env.device)
++        self.prev_xi = torch.zeros(n, self.ctx.dim, device=env.device)
+         self.prev_frame = torch.zeros(n, dtype=torch.long, device=env.device)
+         self.prev_clip = torch.zeros(n, dtype=torch.long, device=env.device)
+         self.ep_start = torch.ones(n, dtype=torch.bool, device=env.device)
+diff --git a/src/supermimic/envs/actions.py b/src/supermimic/envs/actions.py
+index 38979aa..df520c7 100644
+--- a/src/supermimic/envs/actions.py
++++ b/src/supermimic/envs/actions.py
+@@ -25,6 +25,11 @@ class NoisyJointPositionAction(JointPositionAction):
+         super().__init__(cfg, env)
+         self._executed_raw = torch.zeros_like(self._raw_actions)
+         self.noise_std = float(cfg.noise_std)
++        # Action delay (optimisation line): each env executes the action computed ``delay`` control steps ago,
++        # delay ~ U{0..delay_max_steps} per episode. The clean action still feeds observations and the action-rate term.
++        self.delay_max = int(cfg.delay_max_steps)
++        self._hist = torch.zeros(self._raw_actions.shape[0], self.delay_max + 1, self._raw_actions.shape[1], device=self._raw_actions.device)
++        self._delay = torch.zeros(self._raw_actions.shape[0], dtype=torch.long, device=self._raw_actions.device)
+ 
+     @property
+     def executed_raw(self) -> torch.Tensor:
+@@ -32,10 +37,16 @@ class NoisyJointPositionAction(JointPositionAction):
+ 
+     def process_actions(self, actions: torch.Tensor):
+         self._raw_actions[:] = actions
++        if self.delay_max > 0:
++            self._hist = torch.roll(self._hist, 1, dims=1)
++            self._hist[:, 0] = self._raw_actions
++            base = self._hist[torch.arange(self._hist.shape[0], device=self._hist.device), self._delay]
++        else:
++            base = self._raw_actions
+         if self.noise_std > 0:
+-            self._executed_raw = self._raw_actions + self.noise_std * torch.randn_like(self._raw_actions)
++            self._executed_raw = base + self.noise_std * torch.randn_like(base)
+         else:
+-            self._executed_raw = self._raw_actions.clone()
++            self._executed_raw = base.clone()
+         self._processed_actions = self._executed_raw * self._scale + self._offset
+         if self.cfg.clip is not None:
+             self._processed_actions = torch.clamp(
+@@ -45,11 +56,16 @@ class NoisyJointPositionAction(JointPositionAction):
+     def reset(self, env_ids=None) -> None:
+         super().reset(env_ids)
+         self._executed_raw[env_ids] = 0.0
++        if self.delay_max > 0:
++            self._hist[env_ids] = 0.0
++            n = self._delay[env_ids].shape[0]
++            self._delay[env_ids] = torch.randint(0, self.delay_max + 1, (n,), device=self._delay.device)
+ 
+ 
+ @dataclass(kw_only=True)
+ class NoisyJointPositionActionCfg(JointPositionActionCfg):
+     noise_std: float = 0.1
++    delay_max_steps: int = 0
+ 
+     def build(self, env: ManagerBasedRlEnv) -> NoisyJointPositionAction:
+         return NoisyJointPositionAction(self, env)
+diff --git a/src/supermimic/envs/sim2real_dr.py b/src/supermimic/envs/sim2real_dr.py
+new file mode 100644
+index 0000000..ae13fef
+--- /dev/null
++++ b/src/supermimic/envs/sim2real_dr.py
+@@ -0,0 +1,81 @@
++"""Extra dynamics randomisation for sim-to-real (optimisation line; not in the paper or the official release).
++
++Per environment, five scalars (kept on ``env.sm_dr`` so the world-model context xi can carry them):
++  0 armature scale      (startup; needs set_const_0)   reflected rotor inertia of every robot dof
++  1 kp scale            (reset)                        actuator stiffness
++  2 kd scale            (reset)                        actuator damping
++  3 joint damping u     (reset) in [0, 1]              passive damping  = u * damping_per_armature * armature_nominal
++  4 friction loss u     (reset) in [0, 1]              dry friction     = u * frictionloss_per_armature * armature_nominal
++The G1 model has zero nominal passive damping / friction loss, so those two are absolute and sized by the joint's armature
++(bigger motor, more loss). Nominal = [1, 1, 1, 0, 0].
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++import torch
++from mjlab.managers.event_manager import RecomputeLevel, requires_model_fields
++
++if TYPE_CHECKING:
++    from mjlab.envs import ManagerBasedRlEnv
++
++SM_DR_DIM = 5
++SM_DR_NOMINAL = (1.0, 1.0, 1.0, 0.0, 0.0)
++# xi normalisation (offset, scale) for the five scalars with the default ranges below.
++SM_DR_XI_OFFSET = (1.1, 1.0, 1.0, 0.5, 0.5)
++SM_DR_XI_SCALE = (0.4, 0.15, 0.15, 0.5, 0.5)
++
++
++def get_sm_dr(env) -> torch.Tensor:
++    if not hasattr(env, "sm_dr"):
++        env.sm_dr = torch.tensor(SM_DR_NOMINAL, device=env.device).repeat(env.num_envs, 1)
++    return env.sm_dr
++
++
++def _ids(env, env_ids):
++    if env_ids is None:
++        return torch.arange(env.num_envs, device=env.device, dtype=torch.long)
++    return env_ids.to(env.device, dtype=torch.long)
++
++
++def _uniform(n, lo, hi, device):
++    return lo + (hi - lo) * torch.rand(n, device=device)
++
++
++@requires_model_fields("dof_armature", recompute=RecomputeLevel.set_const_0)
++def armature_scale(env: ManagerBasedRlEnv, env_ids, scale_range: tuple[float, float] = (0.7, 1.5), entity_name: str = "robot") -> None:
++    ids = _ids(env, env_ids)
++    v_adr = env.scene[entity_name].indexing.joint_v_adr
++    s = _uniform(len(ids), *scale_range, env.device)
++    default = env.sim.get_default_field("dof_armature")
++    env.sim.model.dof_armature[ids[:, None], v_adr] = default[v_adr][None, :] * s[:, None]
++    get_sm_dr(env)[ids, 0] = s
++
++
++@requires_model_fields("dof_damping", "dof_frictionloss", "actuator_gainprm", "actuator_biasprm")
++def joint_actuator_dr(
++    env: ManagerBasedRlEnv,
++    env_ids,
++    kp_range: tuple[float, float] = (0.85, 1.15),
++    kd_range: tuple[float, float] = (0.85, 1.15),
++    damping_per_armature: float = 10.0,
++    frictionloss_per_armature: float = 20.0,
++    entity_name: str = "robot",
++) -> None:
++    ids = _ids(env, env_ids)
++    n = len(ids)
++    ent = env.scene[entity_name]
++    v_adr, ctrl = ent.indexing.joint_v_adr, ent.indexing.ctrl_ids
++    kp, kd = _uniform(n, *kp_range, env.device), _uniform(n, *kd_range, env.device)
++    ud, uf = torch.rand(n, device=env.device), torch.rand(n, device=env.device)
++    gain0, bias0 = env.sim.get_default_field("actuator_gainprm"), env.sim.get_default_field("actuator_biasprm")
++    arm0 = env.sim.get_default_field("dof_armature")[v_adr]
++    m = env.sim.model
++    m.actuator_gainprm[ids[:, None], ctrl, 0] = gain0[ctrl, 0][None, :] * kp[:, None]
++    m.actuator_biasprm[ids[:, None], ctrl, 1] = bias0[ctrl, 1][None, :] * kp[:, None]
++    m.actuator_biasprm[ids[:, None], ctrl, 2] = bias0[ctrl, 2][None, :] * kd[:, None]
++    m.dof_damping[ids[:, None], v_adr] = damping_per_armature * arm0[None, :] * ud[:, None]
++    m.dof_frictionloss[ids[:, None], v_adr] = frictionloss_per_armature * arm0[None, :] * uf[:, None]
++    dr = get_sm_dr(env)
++    dr[ids, 1], dr[ids, 2], dr[ids, 3], dr[ids, 4] = kp, kd, ud, uf
+diff --git a/src/supermimic/envs/sim_context.py b/src/supermimic/envs/sim_context.py
+index 00b28ee..e761f8f 100644
+--- a/src/supermimic/envs/sim_context.py
++++ b/src/supermimic/envs/sim_context.py
+@@ -9,8 +9,10 @@ XI_DIM = 33
+ 
+ 
+ class SimContext:
+-    def __init__(self, env, foot_geom_regex: str, com_body_name: str = "torso_link", entity_name: str = "robot"):
++    def __init__(self, env, foot_geom_regex: str, com_body_name: str = "torso_link", entity_name: str = "robot", sim2real_dr: bool = False):
+         self.env = env
++        self.sim2real_dr = sim2real_dr  # append the five sim2real scalars (envs/sim2real_dr.py) -> xi is 38-D
++        self.dim = XI_DIM + (5 if sim2real_dr else 0)
+         self.robot = env.scene[entity_name]
+         local_ids, names = self.robot.find_geoms(foot_geom_regex)
+         if len(local_ids) == 0:
+@@ -36,5 +38,9 @@ class SimContext:
+             com = (ipos[self.com_body_global] - self.com_nominal).expand(n, 3)
+         bias = self.robot.data.encoder_bias
+         xi = torch.cat([friction.reshape(n, 1), bias, com], dim=-1)
+-        assert xi.shape == (n, XI_DIM)
++        if self.sim2real_dr:
++            from supermimic.envs.sim2real_dr import get_sm_dr
++
++            xi = torch.cat([xi, get_sm_dr(self.env)], dim=-1)
++        assert xi.shape == (n, self.dim)
+         return xi.clone()
+diff --git a/src/supermimic/envs/tracking_env_cfg.py b/src/supermimic/envs/tracking_env_cfg.py
+index 3066220..ee89681 100644
+--- a/src/supermimic/envs/tracking_env_cfg.py
++++ b/src/supermimic/envs/tracking_env_cfg.py
+@@ -96,6 +96,8 @@ class SuperMimicEnvCfgArgs:
+     anchor_obs: bool = False  # add BeyondMimic anchor-relative pose (9) to the goal group (plan D5 alt.)
+     anchor_obs_mode: str = "full"  # "full" = pos (3) + rot6d (6); "ori" = rot6d (6) only; "ori_window" = official 10-frame rot6d (60)
+     goal_contract: str = "cuboi"  # "official" = official release layout: strided joint targets, anchor body = pelvis
++    sim2real_dr: bool = False  # optimisation line: armature / kp / kd / joint damping / friction loss randomisation (with domain_randomization)
++    action_delay_max: int = 0  # optimisation line: executed action delayed by U{0..N} control steps per episode (with domain_randomization)
+     debug_vis: bool = False  # draw the reference ghost in the viewer (scripts/play.py)
+     extra_command_kwargs: dict = field(default_factory=dict)
+ 
+@@ -148,6 +150,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
+             scale=G1_ACTION_SCALE,
+             use_default_offset=True,
+             noise_std=a.action_noise_std,
++            delay_max_steps=a.action_delay_max if a.domain_randomization else 0,
+         )
+     }
+ 
+@@ -201,6 +204,11 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
+                 "shared_random": True,
+             },
+         )
++        if a.sim2real_dr:
++            from supermimic.envs import sim2real_dr as s2r
++
++            events["sm_armature"] = EventTermCfg(mode="startup", func=s2r.armature_scale, params={"scale_range": (0.7, 1.5)})
++            events["sm_joint_actuator"] = EventTermCfg(mode="reset", func=s2r.joint_actuator_dr, params={"kp_range": (0.85, 1.15), "kd_range": (0.85, 1.15)})
+     else:
+         # Evaluation protocol: foot friction fixed at 1.0, no other randomization.
+         events["foot_friction"] = EventTermCfg(
+@@ -236,7 +244,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
+ 
+     recorders = {}
+     if a.record_transitions:
+-        recorders["replay"] = ReplayRecorderCfg(params={"capacity": a.replay_capacity, "foot_geom_regex": FOOT_GEOM_REGEX, "com_body_name": "torso_link"})
++        recorders["replay"] = ReplayRecorderCfg(params={"capacity": a.replay_capacity, "foot_geom_regex": FOOT_GEOM_REGEX, "com_body_name": "torso_link", "sim2real_dr": a.sim2real_dr})
+ 
+     cfg = ManagerBasedRlEnvCfg(
+         scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": get_g1_robot_cfg()}),
+diff --git a/src/supermimic/imagination/compiled.py b/src/supermimic/imagination/compiled.py
+index 0e18fbd..6c74a73 100644
+--- a/src/supermimic/imagination/compiled.py
++++ b/src/supermimic/imagination/compiled.py
+@@ -34,9 +34,9 @@ class ImagStep:
+             mode = None if compile_mode == "default" else compile_mode
+             self._fn = torch.compile(self._step, mode=mode, dynamic=False)
+ 
+-    def _step(self, s, a, a_prev, xi, ref_body_pos, ref_body_quat, ref_body_lin, ref_body_ang, ref_root_pos, ref_root_quat):
++    def _step(self, s, a, a_exec, a_prev, xi, ref_body_pos, ref_body_quat, ref_body_lin, ref_body_ang, ref_root_pos, ref_root_quat):
+         ref = ReferenceFrame(ref_body_pos, ref_body_quat, ref_body_lin, ref_body_ang, ref_root_pos, ref_root_quat)
+-        s_next = self.wm.step(s, a, xi)
++        s_next = self.wm.step(s, a_exec, xi)  # a_exec = a unless an action delay is simulated
+         bodies = self.wm.heads.robot_bodies(s_next)
+         terms = self.wm.heads.reward(s_next, a, a_prev, ref, bodies)
+         r = terms["total"]
+@@ -47,5 +47,5 @@ class ImagStep:
+         anchor_pose = torch.cat([bodies["pos"][..., ai, :], bodies["quat"][..., ai, :]], dim=-1)  # (n, 7)
+         return s_next, r, term_vec, logits, obs_clean, anchor_pose
+ 
+-    def __call__(self, s, a, a_prev, xi, ref: ReferenceFrame):
+-        return self._fn(s, a, a_prev, xi, ref.body_pos_w, ref.body_quat_w, ref.body_lin_vel_w, ref.body_ang_vel_w, ref.root_pos_w, ref.root_quat_w)
++    def __call__(self, s, a, a_prev, xi, ref: ReferenceFrame, a_exec=None):
++        return self._fn(s, a, a if a_exec is None else a_exec, a_prev, xi, ref.body_pos_w, ref.body_quat_w, ref.body_lin_vel_w, ref.body_ang_vel_w, ref.root_pos_w, ref.root_quat_w)
+diff --git a/src/supermimic/imagination/policy_trainer.py b/src/supermimic/imagination/policy_trainer.py
+index c50576b..25b3b1d 100644
+--- a/src/supermimic/imagination/policy_trainer.py
++++ b/src/supermimic/imagination/policy_trainer.py
+@@ -37,6 +37,7 @@ class PolicyTrainerCfg:
+     anchor_obs: bool = False  # None | "default" | "reduce-overhead" | "max-autotune-no-cudagraphs"
+     anchor_obs_mode: str = "full"  # set from env.anchor_obs_mode by the Trainer
+     goal_contract: str = "cuboi"  # set from env.goal_contract by the Trainer
++    action_delay_max: int = 0  # set from env.action_delay_max by the Trainer
+ 
+ 
+ class PolicyTrainer:
+@@ -67,7 +68,7 @@ class PolicyTrainer:
+         # ---- actor: BPTT through the frozen world model ------------------------------------
+         self.wm.requires_grad_(False)
+         self.critic.requires_grad_(False)
+-        ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, cfg.future_frames, obs_noise=cfg.obs_noise, step_fn=self.step_fn, anchor_obs=cfg.anchor_obs, anchor_obs_mode=cfg.anchor_obs_mode, goal_contract=cfg.goal_contract)
++        ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, cfg.future_frames, obs_noise=cfg.obs_noise, step_fn=self.step_fn, anchor_obs=cfg.anchor_obs, anchor_obs_mode=cfg.anchor_obs_mode, goal_contract=cfg.goal_contract, action_delay_max=cfg.action_delay_max)
+         feat, goals, e_root = self._critic_inputs(ro)
+         if cfg.use_critic:
+             v_H = self.critic(feat[-1], goals[-1], xi_norm, e_root[-1])
+diff --git a/src/supermimic/imagination/rollout.py b/src/supermimic/imagination/rollout.py
+index 1166d4e..1b1d856 100644
+--- a/src/supermimic/imagination/rollout.py
++++ b/src/supermimic/imagination/rollout.py
+@@ -44,6 +44,7 @@ def imagine(
+     anchor_obs: bool = False,
+     anchor_obs_mode: str = "full",
+     goal_contract: str = "cuboi",
++    action_delay_max: int = 0,
+ ) -> ImagRollout:
+     device = start.state.device
+     n = start.state.shape[0]
+@@ -102,10 +103,19 @@ def imagine(
+     e_roots = [wm.heads.root_error_features(s, ref)]
+     term_sum = torch.zeros(len(REWARD_TERM_NAMES), device=device)
+ 
++    if action_delay_max > 0:
++        delay = torch.randint(0, action_delay_max + 1, (n,), device=device)
++        past = [start.hist_actions[-1 - i] for i in range(action_delay_max)]  # a_{t-1}, a_{t-2}, ...
+     for t in range(horizon):
+         obs_flat = flatten_history_term_major(torch.stack(hist, 0))
+         a = policy(obs_flat, goals[-1])
+-        s_next, r, term_vec, logits, obs_clean, anchor_pose = step_fn(s, a, a_prev, start.xi, ref)
++        if action_delay_max > 0:  # the world model is fed the action computed d steps ago (d per rollout row)
++            past.insert(0, a)
++            del past[action_delay_max + 1 :]
++            a_exec = torch.stack(past, 0)[delay, torch.arange(n, device=device)]
++        else:
++            a_exec = None
++        s_next, r, term_vec, logits, obs_clean, anchor_pose = step_fn(s, a, a_prev, start.xi, ref, a_exec)
+         d = torch.sigmoid(logits)
+         c = c * (1.0 - d)
+         term_sum += term_vec.detach().mean(-1)
+diff --git a/src/supermimic/training/loop.py b/src/supermimic/training/loop.py
+index e5658a8..50085df 100644
+--- a/src/supermimic/training/loop.py
++++ b/src/supermimic/training/loop.py
+@@ -37,6 +37,12 @@ class Trainer:
+         else:
+             cfg.policy.goal_dim = cfg.env.future_frames * 68 + ((9 if cfg.env.anchor_obs_mode == "full" else 6) if cfg.env.anchor_obs else 0)
+         cfg.policy_trainer.goal_contract = cfg.env.goal_contract
++        cfg.policy_trainer.action_delay_max = cfg.env.action_delay_max
++        if cfg.env.sim2real_dr and len(cfg.world_model.state_spec.xi_scale) == 33:
++            from supermimic.envs.sim2real_dr import SM_DR_XI_OFFSET, SM_DR_XI_SCALE
++
++            cfg.world_model.state_spec.xi_offset = tuple(cfg.world_model.state_spec.xi_offset) + SM_DR_XI_OFFSET
++            cfg.world_model.state_spec.xi_scale = tuple(cfg.world_model.state_spec.xi_scale) + SM_DR_XI_SCALE
+         cfg.policy_trainer.anchor_obs = cfg.env.anchor_obs
+         cfg.policy_trainer.anchor_obs_mode = cfg.env.anchor_obs_mode
+         self.rank, local_rank, self.world = init_distributed()
+@@ -82,6 +88,8 @@ class Trainer:
+                 anchor_obs=cfg.env.anchor_obs,
+                 anchor_obs_mode=cfg.env.anchor_obs_mode,
+                 goal_contract=cfg.env.goal_contract,
++                sim2real_dr=cfg.env.sim2real_dr,
++                action_delay_max=cfg.env.action_delay_max,
+                 seed=cfg.seed + 1000 * self.rank,
+             ),
+             device=self.device,
+@@ -97,7 +105,7 @@ class Trainer:
+         heads = AnalyticHeads(fk, TRACKED_BODIES, anchor_body_for(cfg.env.goal_contract), ROOT_BODY, robot.data.soft_joint_pos_limits[0].clone(), robot.data.default_joint_pos[0].clone())
+         self.wm = WorldModel(cfg.world_model, heads, self.device)
+         self.policy = Policy(cfg.policy).to(self.device)
+-        self.critic = Critic(cfg.critic, pcfg=cfg.policy).to(self.device)
++        self.critic = Critic(cfg.critic, xi_dim=len(cfg.world_model.state_spec.xi_scale), pcfg=cfg.policy).to(self.device)
+         for m in (self.wm, self.policy, self.critic):
+             broadcast_params(m)
+         self.wm_trainer = WorldModelTrainer(self.wm, self.lib, cfg.wm_trainer)
+diff --git a/src/supermimic/world_model/world_model.py b/src/supermimic/world_model/world_model.py
+index a04c26c..43375bd 100644
+--- a/src/supermimic/world_model/world_model.py
++++ b/src/supermimic/world_model/world_model.py
+@@ -42,7 +42,7 @@ class WorldModel(nn.Module):
+         super().__init__()
+         self.cfg = cfg
+         self.spec = StateSpec(cfg.state_spec, device)
+-        self.dynamics = DynamicsMLP(hidden=cfg.hidden)
++        self.dynamics = DynamicsMLP(hidden=cfg.hidden, xi_dim=len(cfg.state_spec.xi_scale))
+         self.term_head = TerminationHead(cfg.term_hidden, cfg.height_threshold, cfg.tilt_threshold)
+         self.heads = heads  # analytic observation / reward / FK (no parameters)
+         self.to(device)
+-- 
+2.43.0
+

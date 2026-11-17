@@ -1,0 +1,393 @@
+From 112ee9563646d4ee3db6c73ba5b9011d9e2889bd Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 22:21:25 -0500
+Subject: [PATCH 2/4] repro: goal_contract=official (actor goal layout and
+ anchor body of the official release)
+
+Official release (HybridRobotics/supermimic @ 5efbf11): actor goal = joint targets
+[joint_pos, joint_vel] of 10 reference frames spaced 5 control steps apart, plus the
+reference root orientation at those frames relative to the robot root (rot6d), no
+noise on the goal group; anchor body = pelvis. Selected with
+--env.goal-contract official --env.anchor-obs --env.anchor-obs-mode ori_window.
+Goal width 640. Defaults unchanged.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ scripts/diag_drift.py                        |  2 +-
+ scripts/eval_fullclip_traj.py                |  2 +-
+ scripts/eval_push.py                         |  2 +-
+ scripts/media/record_rollout.py              |  2 +-
+ scripts/play.py                              |  2 +-
+ src/supermimic/config.py                     |  1 +
+ src/supermimic/envs/mdp/commands.py          | 10 ++++++++
+ src/supermimic/envs/mdp/motion_library.py    | 22 +++++++++++++++++
+ src/supermimic/envs/mdp/observations.py      |  6 +++++
+ src/supermimic/envs/tracking_env_cfg.py      | 25 +++++++++++++++-----
+ src/supermimic/imagination/policy_trainer.py |  3 ++-
+ src/supermimic/imagination/rollout.py        |  6 ++++-
+ src/supermimic/policy/nets.py                |  6 +++++
+ src/supermimic/training/loop.py              | 16 +++++++++----
+ src/supermimic/world_model/heads.py          | 11 +++++++++
+ 15 files changed, 99 insertions(+), 17 deletions(-)
+
+diff --git a/scripts/diag_drift.py b/scripts/diag_drift.py
+index 48a15fd..1b6bd94 100644
+--- a/scripts/diag_drift.py
++++ b/scripts/diag_drift.py
+@@ -38,7 +38,7 @@ def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] |
+     args = SuperMimicEnvCfgArgs(
+         npz_files=files, num_envs=n, future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
+         action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False,
+-        sampling_mode="start", record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"),
++        sampling_mode="start", record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"), goal_contract=cfg["env"].get("goal_contract", "cuboi"),
+     )
+     env = make_env(args, device=device)
+     try:
+diff --git a/scripts/eval_fullclip_traj.py b/scripts/eval_fullclip_traj.py
+index 4453e2f..c95054a 100644
+--- a/scripts/eval_fullclip_traj.py
++++ b/scripts/eval_fullclip_traj.py
+@@ -119,7 +119,7 @@ def main(ckpt: Path, out: Path, clips: list[str] | None = None, npz_dir: Path =
+     args = SuperMimicEnvCfgArgs(
+         npz_files=files, num_envs=n, future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
+         action_noise_std=action_noise_std, obs_noise=obs_noise, reset_noise=reset_noise, domain_randomization=domain_randomization,
+-        sampling_mode="start", record_transitions=False, seed=seed, anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"),
++        sampling_mode="start", record_transitions=False, seed=seed, anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"), goal_contract=cfg["env"].get("goal_contract", "cuboi"),
+     )
+     from mjlab.envs import ManagerBasedRlEnv
+     from mjlab.utils.torch import configure_torch_backends
+diff --git a/scripts/eval_push.py b/scripts/eval_push.py
+index 6711dcf..4003c65 100644
+--- a/scripts/eval_push.py
++++ b/scripts/eval_push.py
+@@ -62,7 +62,7 @@ def main(ckpt: Path, speeds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), num_envs:
+     policy, cfg = load_policy_from_checkpoint(ckpt, device)
+     tmp = Path(tempfile.mkdtemp()) / "tpose.npz"
+     make_tpose_clip(tmp)
+-    args = SuperMimicEnvCfgArgs(npz_files=[str(tmp)], num_envs=num_envs, action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False, sampling_mode="start", record_transitions=False, episode_length_s=1e5, future_frames=cfg["env"]["future_frames"], anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"), seed=0)
++    args = SuperMimicEnvCfgArgs(npz_files=[str(tmp)], num_envs=num_envs, action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False, sampling_mode="start", record_transitions=False, episode_length_s=1e5, future_frames=cfg["env"]["future_frames"], anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"), goal_contract=cfg["env"].get("goal_contract", "cuboi"), seed=0)
+     env = make_env(args, device=device)
+     robot = env.scene["robot"]
+     cmd = env.command_manager.get_term("motion")
+diff --git a/scripts/media/record_rollout.py b/scripts/media/record_rollout.py
+index be782e4..2b16212 100644
+--- a/scripts/media/record_rollout.py
++++ b/scripts/media/record_rollout.py
+@@ -32,7 +32,7 @@ def main(ckpt: Path, clips: list[str], npz_dir: Path = Path("data/npz/bones_seed
+     args = SuperMimicEnvCfgArgs(
+         npz_files=files, num_envs=n, future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
+         action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False, sampling_mode="start",
+-        record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"),
++        record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"), goal_contract=cfg["env"].get("goal_contract", "cuboi"),
+     )
+     env = make_env(args, device=device)
+     try:
+diff --git a/scripts/play.py b/scripts/play.py
+index 44c9960..d5a1c72 100644
+--- a/scripts/play.py
++++ b/scripts/play.py
+@@ -60,7 +60,7 @@ def main(
+         sampling_mode=sampling,
+         record_transitions=False,
+         seed=0,
+-        anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"),
++        anchor_obs=cfg["env"].get("anchor_obs", False), anchor_obs_mode=cfg["env"].get("anchor_obs_mode", "full"), goal_contract=cfg["env"].get("goal_contract", "cuboi"),
+         debug_vis=ghost,
+     )
+     env = RslRlVecEnvWrapper(make_env(args, device=device))
+diff --git a/src/supermimic/config.py b/src/supermimic/config.py
+index 69486fc..58b17c5 100644
+--- a/src/supermimic/config.py
++++ b/src/supermimic/config.py
+@@ -33,6 +33,7 @@ class EnvCfg:
+     future_frames: int = 10
+     compact_library: bool = False
+     anchor_obs: bool = False
++    goal_contract: str = "cuboi"  # "official" = goal layout + anchor body of the official release (needs anchor_obs_mode ori_window)
+     anchor_obs_mode: str = "full"  # with anchor_obs: "full" = position (3) + rot6d (6); "ori" = rot6d (6) only (IMU-observable)
+ 
+ 
+diff --git a/src/supermimic/envs/mdp/commands.py b/src/supermimic/envs/mdp/commands.py
+index 3f4822e..6dd1eda 100644
+--- a/src/supermimic/envs/mdp/commands.py
++++ b/src/supermimic/envs/mdp/commands.py
+@@ -95,8 +95,17 @@ class MultiClipMotionCommand(CommandTerm):
+ 
+     @property
+     def goal(self) -> torch.Tensor:
++        if self.cfg.goal_contract == "official":
++            return self.library.goal_window_official(self.frame)
+         return self.library.goal_window(self.frame, self.cfg.future_frames)
+ 
++    @property
++    def anchor_ori_window(self) -> torch.Tensor:
++        """(N, 60) official-layout relative orientation window (robot anchor -> reference root)."""
++        from supermimic.world_model.heads import anchor_ori_window_obs
++
++        return anchor_ori_window_obs(self.robot_anchor_quat_w, self.library.root_quat_window_official(self.frame))
++
+     @property
+     def joint_pos(self) -> torch.Tensor:
+         return self._ref.joint_pos
+@@ -402,6 +411,7 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
+     body_names: tuple[str, ...]
+     entity_name: str = "robot"
+     future_frames: int = 10
++    goal_contract: str = "cuboi"  # "official": strided joint-target window of the official release
+     bin_frames: int = 50
+     pose_range: dict[str, tuple[float, float]] = field(default_factory=dict)
+     velocity_range: dict[str, tuple[float, float]] = field(default_factory=dict)
+diff --git a/src/supermimic/envs/mdp/motion_library.py b/src/supermimic/envs/mdp/motion_library.py
+index 48cbfdd..52760cc 100644
+--- a/src/supermimic/envs/mdp/motion_library.py
++++ b/src/supermimic/envs/mdp/motion_library.py
+@@ -233,6 +233,28 @@ class MotionLibrary:
+         feat = goal_features(self.ref(idx.reshape(-1)), self.default_joint_pos)
+         return feat.reshape(frame.shape[0], k * GOAL_FEAT_DIM)
+ 
++    # ---- goal layout of the official release (HybridRobotics/supermimic @ 5efbf11, representations.py):
++    # 10 reference frames spaced 5 control steps apart (~0.9 s lookahead), clamped at the clip end; per frame
++    # [joint_pos (29), joint_vel (29)]; plus the reference root orientation at the same frames.
++    OFFICIAL_FRAMES = 10
++    OFFICIAL_STRIDE = 5
++
++    def official_window_idx(self, frame: torch.Tensor) -> torch.Tensor:
++        last = self.last_frame_of(frame)
++        offs = torch.arange(self.OFFICIAL_FRAMES, device=self.device) * self.OFFICIAL_STRIDE
++        return torch.minimum(frame[:, None] + offs[None, :], last[:, None])  # (N, 10)
++
++    def goal_window_official(self, frame: torch.Tensor) -> torch.Tensor:
++        """(N, 10*58) joint targets of the strided future window."""
++        idx = self.official_window_idx(frame)
++        r = self.ref(idx.reshape(-1))
++        return torch.cat([r.joint_pos, r.joint_vel], dim=-1).reshape(frame.shape[0], -1)
++
++    def root_quat_window_official(self, frame: torch.Tensor) -> torch.Tensor:
++        """(N, 10, 4) reference root (pelvis) orientation at the strided window frames."""
++        idx = self.official_window_idx(frame)
++        return self.ref(idx.reshape(-1)).root_quat_w.reshape(frame.shape[0], self.OFFICIAL_FRAMES, 4)
++
+     def ref_qpos_qvel(self, frame: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+         """MuJoCo-layout reference state: qpos (N,36) and qvel (N,35; root ang vel in body frame)."""
+         r = self.ref(frame)
+diff --git a/src/supermimic/envs/mdp/observations.py b/src/supermimic/envs/mdp/observations.py
+index 6951355..9769d92 100644
+--- a/src/supermimic/envs/mdp/observations.py
++++ b/src/supermimic/envs/mdp/observations.py
+@@ -14,3 +14,9 @@ def goal_future_frames(env: ManagerBasedRlEnv, command_name: str) -> torch.Tenso
+     """(N, K*68) future reference-frame features (plan D5)."""
+     command = cast(MultiClipMotionCommand, env.command_manager.get_term(command_name))
+     return command.goal
++
++
++def goal_anchor_ori_window(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
++    """(N, 60) reference root orientation over the official goal window, relative to the robot anchor."""
++    command = cast(MultiClipMotionCommand, env.command_manager.get_term(command_name))
++    return command.anchor_ori_window
+diff --git a/src/supermimic/envs/tracking_env_cfg.py b/src/supermimic/envs/tracking_env_cfg.py
+index 081cdb8..3066220 100644
+--- a/src/supermimic/envs/tracking_env_cfg.py
++++ b/src/supermimic/envs/tracking_env_cfg.py
+@@ -63,6 +63,12 @@ TRACKED_BODIES = (
+     "right_wrist_yaw_link",
+ )
+ ANCHOR_BODY = "torso_link"
++
++
++def anchor_body_for(goal_contract: str) -> str:
++    """Cuboi anchors rewards / relative poses on torso_link; the official release sets the anchor to the pelvis."""
++    assert goal_contract in ("cuboi", "official"), goal_contract
++    return "pelvis" if goal_contract == "official" else ANCHOR_BODY
+ ROOT_BODY = "pelvis"
+ FOOT_GEOM_REGEX = r"^(left|right)_foot[1-7]_collision$"
+ 
+@@ -88,7 +94,8 @@ class SuperMimicEnvCfgArgs:
+     bin_frames: int = 50
+     compact_library: bool = False
+     anchor_obs: bool = False  # add BeyondMimic anchor-relative pose (9) to the goal group (plan D5 alt.)
+-    anchor_obs_mode: str = "full"  # "full" = pos (3) + rot6d (6); "ori" = rot6d (6) only: no global position needed
++    anchor_obs_mode: str = "full"  # "full" = pos (3) + rot6d (6); "ori" = rot6d (6) only; "ori_window" = official 10-frame rot6d (60)
++    goal_contract: str = "cuboi"  # "official" = official release layout: strided joint targets, anchor body = pelvis
+     debug_vis: bool = False  # draw the reference ghost in the viewer (scripts/play.py)
+     extra_command_kwargs: dict = field(default_factory=dict)
+ 
+@@ -115,10 +122,15 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
+             terms={
+                 "future_frames": ObservationTermCfg(func=sm_obs.goal_future_frames, params={"command_name": "motion"}),
+                 **(
+-                    {
+-                        **({"anchor_pos": ObservationTermCfg(func=track_mdp.motion_anchor_pos_b, params={"command_name": "motion"}, noise=noise(-0.25, 0.25))} if a.anchor_obs_mode == "full" else {}),
+-                        "anchor_ori": ObservationTermCfg(func=track_mdp.motion_anchor_ori_b, params={"command_name": "motion"}, noise=noise(-0.05, 0.05)),
+-                    }
++                    (
++                        # official release: no corruption on the goal group
++                        {"anchor_ori_window": ObservationTermCfg(func=sm_obs.goal_anchor_ori_window, params={"command_name": "motion"})}
++                        if a.anchor_obs_mode == "ori_window"
++                        else {
++                            **({"anchor_pos": ObservationTermCfg(func=track_mdp.motion_anchor_pos_b, params={"command_name": "motion"}, noise=noise(-0.25, 0.25))} if a.anchor_obs_mode == "full" else {}),
++                            "anchor_ori": ObservationTermCfg(func=track_mdp.motion_anchor_ori_b, params={"command_name": "motion"}, noise=noise(-0.05, 0.05)),
++                        }
++                    )
+                     if a.anchor_obs
+                     else {}
+                 ),
+@@ -145,8 +157,9 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
+     commands = {
+         "motion": MultiClipMotionCommandCfg(
+             npz_files=[str(f) for f in a.npz_files],
+-            anchor_body_name=ANCHOR_BODY,
++            anchor_body_name=anchor_body_for(a.goal_contract),
+             root_body_name=ROOT_BODY,
++            goal_contract=a.goal_contract,
+             body_names=TRACKED_BODIES,
+             entity_name="robot",
+             future_frames=a.future_frames,
+diff --git a/src/supermimic/imagination/policy_trainer.py b/src/supermimic/imagination/policy_trainer.py
+index 08b8155..c50576b 100644
+--- a/src/supermimic/imagination/policy_trainer.py
++++ b/src/supermimic/imagination/policy_trainer.py
+@@ -36,6 +36,7 @@ class PolicyTrainerCfg:
+     compile: str | None = "default"
+     anchor_obs: bool = False  # None | "default" | "reduce-overhead" | "max-autotune-no-cudagraphs"
+     anchor_obs_mode: str = "full"  # set from env.anchor_obs_mode by the Trainer
++    goal_contract: str = "cuboi"  # set from env.goal_contract by the Trainer
+ 
+ 
+ class PolicyTrainer:
+@@ -66,7 +67,7 @@ class PolicyTrainer:
+         # ---- actor: BPTT through the frozen world model ------------------------------------
+         self.wm.requires_grad_(False)
+         self.critic.requires_grad_(False)
+-        ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, cfg.future_frames, obs_noise=cfg.obs_noise, step_fn=self.step_fn, anchor_obs=cfg.anchor_obs, anchor_obs_mode=cfg.anchor_obs_mode)
++        ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, cfg.future_frames, obs_noise=cfg.obs_noise, step_fn=self.step_fn, anchor_obs=cfg.anchor_obs, anchor_obs_mode=cfg.anchor_obs_mode, goal_contract=cfg.goal_contract)
+         feat, goals, e_root = self._critic_inputs(ro)
+         if cfg.use_critic:
+             v_H = self.critic(feat[-1], goals[-1], xi_norm, e_root[-1])
+diff --git a/src/supermimic/imagination/rollout.py b/src/supermimic/imagination/rollout.py
+index 86742b6..1166d4e 100644
+--- a/src/supermimic/imagination/rollout.py
++++ b/src/supermimic/imagination/rollout.py
+@@ -10,7 +10,7 @@ from supermimic.data.replay_buffer import StartBatch
+ from supermimic.envs.mdp.motion_library import MotionLibrary
+ from supermimic.imagination.compiled import REWARD_TERM_NAMES, ImagStep
+ from supermimic.policy.nets import Policy
+-from supermimic.world_model.heads import ReferenceFrame, analytic_observation, anchor_relative_obs, flatten_history_term_major
++from supermimic.world_model.heads import ReferenceFrame, analytic_observation, anchor_ori_window_obs, anchor_relative_obs, flatten_history_term_major
+ from supermimic.world_model.wm_trainer import reference_at
+ from supermimic.world_model.world_model import WorldModel
+ 
+@@ -43,6 +43,7 @@ def imagine(
+     step_fn: ImagStep | None = None,
+     anchor_obs: bool = False,
+     anchor_obs_mode: str = "full",
++    goal_contract: str = "cuboi",
+ ) -> ImagRollout:
+     device = start.state.device
+     n = start.state.shape[0]
+@@ -58,6 +59,9 @@ def imagine(
+         return o
+ 
+     def make_goal(frame_t, ref_t, anchor_pose):
++        if goal_contract == "official":  # joint-target window + windowed relative orientation, no noise (as the official goal group)
++            g = lib.goal_window_official(frame_t)
++            return torch.cat([g, anchor_ori_window_obs(anchor_pose[..., 3:7], lib.root_quat_window_official(frame_t))], dim=-1)
+         g = lib.goal_window(frame_t, future_frames)
+         if not anchor_obs:
+             return g
+diff --git a/src/supermimic/policy/nets.py b/src/supermimic/policy/nets.py
+index 0b60533..29d10d1 100644
+--- a/src/supermimic/policy/nets.py
++++ b/src/supermimic/policy/nets.py
+@@ -27,6 +27,7 @@ class PolicyCfg:
+     goal_term_scale: tuple[float, ...] = (1.0, 5.0, 1.0, 2.0, 1.0, 1.0)
+     decoder_last_gain: float = 0.01
+     goal_dim: int = GOAL_DIM  # 680 (+9 with anchor_obs)
++    goal_layout: str = "cuboi"  # "official": 10 x [joint_pos 29, joint_vel 29] + 60 rot6d
+ 
+ 
+ @dataclass
+@@ -42,6 +43,11 @@ def _obs_scale_vector(cfg: PolicyCfg) -> torch.Tensor:
+ 
+ 
+ def _goal_scale_vector(cfg: PolicyCfg, goal_dim: int) -> torch.Tensor:
++    if cfg.goal_layout == "official":
++        per_frame = torch.cat([torch.full((29,), 1.0 / cfg.goal_term_scale[0]), torch.full((29,), 1.0 / cfg.goal_term_scale[1])])
++        k, extra = divmod(goal_dim, 58)
++        assert (k, extra) == (11, 2) or goal_dim == 640, goal_dim  # 580 + 60
++        return torch.cat([per_frame.repeat(10), torch.ones(goal_dim - 580)])
+     sizes = (29, 29, 3, 3, 3, 1)
+     per_frame = torch.cat([torch.full((n,), 1.0 / s) for n, s in zip(sizes, cfg.goal_term_scale)])
+     k, extra = divmod(goal_dim, 68)
+diff --git a/src/supermimic/training/loop.py b/src/supermimic/training/loop.py
+index ed017ad..e5658a8 100644
+--- a/src/supermimic/training/loop.py
++++ b/src/supermimic/training/loop.py
+@@ -14,7 +14,7 @@ from supermimic.config import TrainConfig
+ from supermimic.data.motion_convert import load_g1_model
+ from supermimic.envs import SuperMimicEnvCfgArgs, make_env
+ from supermimic.envs.mdp.motion_library import discover_npz
+-from supermimic.envs.tracking_env_cfg import ANCHOR_BODY, ROOT_BODY, TRACKED_BODIES
++from supermimic.envs.tracking_env_cfg import ANCHOR_BODY, ROOT_BODY, TRACKED_BODIES, anchor_body_for
+ from supermimic.imagination.policy_trainer import PolicyTrainer
+ from supermimic.kinematics.g1_fk import G1Kinematics
+ from supermimic.policy.nets import Critic, Policy
+@@ -28,8 +28,15 @@ from supermimic.world_model.world_model import WorldModel
+ class Trainer:
+     def __init__(self, cfg: TrainConfig):
+         self.cfg = cfg
+-        assert cfg.env.anchor_obs_mode in ("full", "ori"), cfg.env.anchor_obs_mode
+-        cfg.policy.goal_dim = cfg.env.future_frames * 68 + ((9 if cfg.env.anchor_obs_mode == "full" else 6) if cfg.env.anchor_obs else 0)
++        assert cfg.env.anchor_obs_mode in ("full", "ori", "ori_window"), cfg.env.anchor_obs_mode
++        official = cfg.env.goal_contract == "official"
++        assert official == (cfg.env.anchor_obs and cfg.env.anchor_obs_mode == "ori_window"), "goal_contract=official goes with --env.anchor-obs --env.anchor-obs-mode ori_window (and only with it)"
++        if official:
++            cfg.policy.goal_dim = 640  # 10 x 58 joint targets + 10 x 6 relative orientation
++            cfg.policy.goal_layout = "official"
++        else:
++            cfg.policy.goal_dim = cfg.env.future_frames * 68 + ((9 if cfg.env.anchor_obs_mode == "full" else 6) if cfg.env.anchor_obs else 0)
++        cfg.policy_trainer.goal_contract = cfg.env.goal_contract
+         cfg.policy_trainer.anchor_obs = cfg.env.anchor_obs
+         cfg.policy_trainer.anchor_obs_mode = cfg.env.anchor_obs_mode
+         self.rank, local_rank, self.world = init_distributed()
+@@ -74,6 +81,7 @@ class Trainer:
+                 compact_library=cfg.env.compact_library,
+                 anchor_obs=cfg.env.anchor_obs,
+                 anchor_obs_mode=cfg.env.anchor_obs_mode,
++                goal_contract=cfg.env.goal_contract,
+                 seed=cfg.seed + 1000 * self.rank,
+             ),
+             device=self.device,
+@@ -86,7 +94,7 @@ class Trainer:
+         robot = env.scene["robot"]
+ 
+         fk = G1Kinematics(load_g1_model(), device=self.device)
+-        heads = AnalyticHeads(fk, TRACKED_BODIES, ANCHOR_BODY, ROOT_BODY, robot.data.soft_joint_pos_limits[0].clone(), robot.data.default_joint_pos[0].clone())
++        heads = AnalyticHeads(fk, TRACKED_BODIES, anchor_body_for(cfg.env.goal_contract), ROOT_BODY, robot.data.soft_joint_pos_limits[0].clone(), robot.data.default_joint_pos[0].clone())
+         self.wm = WorldModel(cfg.world_model, heads, self.device)
+         self.policy = Policy(cfg.policy).to(self.device)
+         self.critic = Critic(cfg.critic, pcfg=cfg.policy).to(self.device)
+diff --git a/src/supermimic/world_model/heads.py b/src/supermimic/world_model/heads.py
+index 2a20d27..8f61ab6 100644
+--- a/src/supermimic/world_model/heads.py
++++ b/src/supermimic/world_model/heads.py
+@@ -51,6 +51,17 @@ def anchor_relative_obs(robot_anchor_pos: torch.Tensor, robot_anchor_quat: torch
+     return torch.cat([pos, mat[..., :2].reshape(*q12.shape[:-1], 6)], dim=-1)
+ 
+ 
++def anchor_ori_window_obs(robot_anchor_quat: torch.Tensor, ref_quat_window: torch.Tensor) -> torch.Tensor:
++    """Reference root orientation at each window frame, relative to the robot anchor: (N, K*6) rot6d.
++    Official release: actor goal = [joint targets, rel_ori]; rel_pos goes to the world model only."""
++    from supermimic.kinematics.rotations import matrix_from_quat, quat_inv, quat_mul
++
++    k = ref_quat_window.shape[-2]
++    q10 = quat_inv(robot_anchor_quat)[..., None, :].expand(*ref_quat_window.shape)
++    mat = matrix_from_quat(quat_mul(q10, ref_quat_window))
++    return mat[..., :2].reshape(*ref_quat_window.shape[:-2], k * 6)
++
++
+ ANCHOR_OBS_DIM = 9
+ 
+ 
+-- 
+2.43.0
+

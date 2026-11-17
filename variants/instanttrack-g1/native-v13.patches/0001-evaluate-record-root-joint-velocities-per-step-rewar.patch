@@ -1,0 +1,50 @@
+From 8a8e2e6b82c53c11a2966dec52a44499ce786c1d Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 21:24:04 -0500
+Subject: [PATCH] evaluate: record root/joint velocities, per-step reward,
+ failed/steps for trajectory evidence (record mode only)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/instanttrack/evaluate.py | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/instanttrack/evaluate.py b/src/instanttrack/evaluate.py
+index 68c421b..c0032c5 100644
+--- a/src/instanttrack/evaluate.py
++++ b/src/instanttrack/evaluate.py
+@@ -107,7 +107,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
+     ret = torch.zeros(N, device=dev)
+     steps = torch.zeros(N, device=dev)
+     hist = None
+-    traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
++    traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": [], "root_v": [], "root_w": [], "qd": [], "r": []}
+     while not bool(env.done_eval.all()):
+         S = env.state()
+         o = env.observe()
+@@ -119,7 +119,11 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
+ 
+             traj["root_p"].append(S[0].cpu()), traj["root_quat"].append(mat_to_quat(S[1]).cpu())
+             traj["q"].append(S[4].cpu()), traj["f"].append(env.f.cpu()), traj["alive"].append(alive.cpu())
++            # added (supermimic instanttrack-g1 variant): full velocity state for qpos/qvel trajectory evidence
++            traj["root_v"].append(S[2].cpu()), traj["root_w"].append(S[3].cpu()), traj["qd"].append(S[5].cpu())
+         out = env.step(a)
++        if record:
++            traj["r"].append(out["r"].cpu())
+         ret += torch.where(alive, out["r"], 0.0)
+         steps += alive.float()
+         env.f = torch.minimum(env.f, clip_end - 1)  # finished clips keep stepping; keep f+1 in range
+@@ -139,7 +143,9 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
+     if record:
+         np.savez_compressed(record, names=np.array(motion.names), **{k: torch.stack(v).numpy() for k, v in traj.items()},
+                             ref_root_p=motion.root_p.cpu().numpy(), ref_root_R=motion.root_R.cpu().numpy(), ref_q=motion.q.cpu().numpy(),
+-                            clip_start=motion.clip_start.cpu().numpy(), clip_len=motion.clip_len.cpu().numpy())  # fmt: skip
++                            clip_start=motion.clip_start.cpu().numpy(), clip_len=motion.clip_len.cpu().numpy(),
++                            failed_eval=env.failed_eval.cpu().numpy(), steps=steps.cpu().numpy(), ret=ret.cpu().numpy(),
++                            layout="root_w is world-frame angular velocity (env.state); alive[t] is before step t")  # fmt: skip
+     return res
+ 
+ 
+-- 
+2.43.0
+

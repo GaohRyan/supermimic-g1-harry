@@ -1,0 +1,125 @@
+From 7a9d4a25ca8b390355d8a50b1cfad6dbc958ac4e Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:49:34 -0500
+Subject: [PATCH 17/19] terrain: warm start carries the optimizer state of a
+ Muon-trained checkpoint too
+
+expand_optimizer_state takes the optimizer of the extended network and handles the two-part state (AdamW + Muon on
+the hidden weights). An AdamW-only state does not fit the two-part optimizer: it is refused and that optimizer starts
+fresh, as before.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ src/supermimic/terrain/expand.py | 32 ++++++++++++++++++++++----------
+ src/supermimic/training/loop.py  |  2 +-
+ tests/test_terrain_lifts.py      | 29 +++++++++++++++++++++++++++++
+ 3 files changed, 52 insertions(+), 11 deletions(-)
+
+diff --git a/src/supermimic/terrain/expand.py b/src/supermimic/terrain/expand.py
+index fd51693..8ffba7f 100644
+--- a/src/supermimic/terrain/expand.py
++++ b/src/supermimic/terrain/expand.py
+@@ -41,13 +41,7 @@ def load_state_dict_expand(module: nn.Module, state: dict, allow_missing_prefixe
+     return {"expanded": expanded, "missing": missing}
+ 
+ 
+-def expand_optimizer_state(sd: dict, params: list) -> dict | None:
+-    """Fit an Adam / AdamW state saved for a network with fewer inputs to the extended network.
+-
+-    ``params``: the parameters of the extended network in optimizer order. The moment tensors of a weight whose input
+-    dimension grew are padded with zeros (the new columns start with an empty history); everything else is kept, so
+-    the trained part of the network continues with its accumulated moments instead of a cold optimizer.
+-    Returns None when the state cannot be matched (other layout changes, several parameter groups)."""
++def _expand_single(sd: dict, params: list) -> dict | None:
+     import copy
+ 
+     if "state" not in sd or len(sd.get("param_groups", [])) != 1:
+@@ -60,10 +54,9 @@ def expand_optimizer_state(sd: dict, params: list) -> dict | None:
+         st = out["state"].get(i)
+         if st is None:
+             continue
+-        for k in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+-            if k not in st or st[k].shape == p.shape:
++        for k, old in list(st.items()):
++            if not torch.is_tensor(old) or old.ndim == 0 or old.shape == p.shape:
+                 continue
+-            old = st[k]
+             if old.ndim == 2 and p.ndim == 2 and old.shape[0] == p.shape[0] and old.shape[1] < p.shape[1]:
+                 new = torch.zeros(p.shape, dtype=old.dtype, device=old.device)
+                 new[:, : old.shape[1]] = old
+@@ -71,3 +64,22 @@ def expand_optimizer_state(sd: dict, params: list) -> dict | None:
+             else:
+                 return None
+     return out
++
++
++def expand_optimizer_state(sd: dict, target) -> dict | None:
++    """Fit an optimizer state saved for a network with fewer inputs to the extended network.
++
++    ``target``: the optimizer of the extended network (AdamW, or the MultiOpt of AdamW + Muon of
++    supermimic.training.optim), or its parameters in optimizer order (single optimizer). The moment tensors of a weight
++    whose input dimension grew are padded with zeros (the new columns start with an empty history); everything else is
++    kept, so the trained part of the network continues with its accumulated moments instead of a cold optimizer.
++    Returns None when the state cannot be matched (another optimizer layout, other shape changes)."""
++    if isinstance(target, (list, tuple)):
++        return _expand_single(sd, list(target))
++    opts = getattr(target, "opts", None)
++    if opts is None:
++        return _expand_single(sd, [p for g in target.param_groups for p in g["params"]])
++    if "multi" not in sd or len(sd["multi"]) != len(opts):
++        return None
++    parts = [_expand_single(part, [p for g in o.param_groups for p in g["params"]]) for part, o in zip(sd["multi"], opts)]
++    return None if any(part is None for part in parts) else {"multi": parts}
+diff --git a/src/supermimic/training/loop.py b/src/supermimic/training/loop.py
+index dd5b19b..a4345bb 100644
+--- a/src/supermimic/training/loop.py
++++ b/src/supermimic/training/loop.py
+@@ -223,7 +223,7 @@ class Trainer:
+         }
+         fresh = []
+         for key, (opt, module, kw) in opts.items():
+-            sd = expand_optimizer_state(ck[key], list(module.parameters())) if key in ck else None
++            sd = expand_optimizer_state(ck[key], opt) if key in ck else None
+             if sd is None or not load_optimizer_state(opt, sd, **kw):
+                 fresh.append(key)
+         if ck["bin_return"].shape == self.command.bin_return.shape:  # same motion library: keep the sampler's difficulty estimates
+diff --git a/tests/test_terrain_lifts.py b/tests/test_terrain_lifts.py
+index a0b8a10..9bbf533 100644
+--- a/tests/test_terrain_lifts.py
++++ b/tests/test_terrain_lifts.py
+@@ -143,3 +143,32 @@ def test_expanded_checkpoint_and_optimizer_state():
+     # a layout that does not match is refused
+     other = torch.nn.Sequential(torch.nn.Linear(10, 8), torch.nn.ELU(), torch.nn.Linear(8, 3))
+     assert expand_optimizer_state(opt.state_dict(), list(other.parameters())) is None
++
++
++def test_expanded_optimizer_state_with_muon_on_the_hidden_layers():
++    """Warm start from a run that used Muon on the hidden weights: both parts of the optimizer state carry over."""
++    pytest.importorskip("torch.optim", reason="torch")
++    if not hasattr(torch.optim, "Muon"):
++        pytest.skip("this torch has no Muon")
++    from supermimic.training.optim import build_optimizer, load_optimizer_state
++
++    torch.manual_seed(0)
++    mk = lambda n_in: torch.nn.Sequential(torch.nn.Linear(n_in, 16), torch.nn.ELU(), torch.nn.Linear(16, 16), torch.nn.ELU(), torch.nn.Linear(16, 3))  # noqa: E731
++    old, new = mk(6), mk(10)
++    opt = build_optimizer(old, 1e-3, hidden="muon")
++    x = torch.randn(32, 6)
++    for _ in range(4):
++        opt.zero_grad()
++        old(x).pow(2).mean().backward()
++        opt.step()
++    load_state_dict_expand(new, old.state_dict())
++    opt2 = build_optimizer(new, 1e-3, hidden="muon")
++    sd = expand_optimizer_state(opt.state_dict(), opt2)
++    assert sd is not None and load_optimizer_state(opt2, sd)
++    for o, net, inp in ((opt, old, x), (opt2, new, torch.cat([x, torch.zeros(32, 4)], -1))):
++        o.zero_grad()
++        net(inp).pow(2).mean().backward()
++        o.step()
++    assert torch.allclose(new[0].weight[:, :6], old[0].weight, atol=1e-6) and torch.allclose(new[2].weight, old[2].weight, atol=1e-6)
++    # an AdamW-only state does not fit the two-part optimizer: refused, the caller starts that optimizer fresh
++    assert expand_optimizer_state(torch.optim.AdamW(old.parameters()).state_dict(), opt2) is None
+-- 
+2.43.0
+

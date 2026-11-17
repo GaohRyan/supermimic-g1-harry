@@ -1,0 +1,83 @@
+From e10d0e7f0ec168ff2d03f8b8121b292cc5a32842 Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:08:24 -0500
+Subject: [PATCH 4/6] training: opt-in W&B mirror of TensorBoard scalars
+ (SM_WANDB_MODE, default off)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/supermimic/training/loop.py      |  4 +++
+ src/supermimic/training/wandb_tee.py | 46 ++++++++++++++++++++++++++++
+ 2 files changed, 50 insertions(+)
+ create mode 100644 src/supermimic/training/wandb_tee.py
+
+diff --git a/src/supermimic/training/loop.py b/src/supermimic/training/loop.py
+index b75a0d1..6f1b0a7 100644
+--- a/src/supermimic/training/loop.py
++++ b/src/supermimic/training/loop.py
+@@ -45,6 +45,10 @@ class Trainer:
+         if self.is_main:
+             (self.log_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2, default=str))
+         self.writer = SummaryWriter(str(self.log_dir / "tb")) if self.is_main else None
++        if self.writer is not None:
++            from supermimic.training.wandb_tee import TeeWriter
++
++            self.writer = TeeWriter(self.writer, self.log_dir)  # no-op unless SM_WANDB_MODE is set
+ 
+         if cfg.data.library is not None:
+             files = [cfg.data.library]
+diff --git a/src/supermimic/training/wandb_tee.py b/src/supermimic/training/wandb_tee.py
+new file mode 100644
+index 0000000..8acc778
+--- /dev/null
++++ b/src/supermimic/training/wandb_tee.py
+@@ -0,0 +1,46 @@
++"""Opt-in W&B mirror of the TensorBoard scalars (corrected-baseline).
++
++Enabled only when SM_WANDB_MODE is set ("offline" by default policy; "online" needs WANDB_API_KEY in the
++process env). TensorBoard stays the authoritative log; this never changes training behaviour, and any W&B
++failure disables the mirror instead of raising.
++"""
++from __future__ import annotations
++
++import os
++
++
++class TeeWriter:
++    def __init__(self, tb_writer, log_dir, config: dict | None = None):
++        self.tb = tb_writer
++        self.run = None
++        mode = os.environ.get("SM_WANDB_MODE")
++        if not mode:
++            return
++        try:
++            import wandb
++
++            self.run = wandb.init(
++                project=os.environ.get("SM_WANDB_PROJECT", "supermimic"),
++                name=os.environ.get("SM_RUN_ID"), id=os.environ.get("SM_RUN_ID"),
++                dir=str(log_dir), mode=mode, config=config or {},
++                tags=[t for t in os.environ.get("SM_WANDB_TAGS", "").split(",") if t],
++            )
++        except Exception as exc:  # mirror is optional
++            print(f"[wandb_tee] disabled: {type(exc).__name__}")
++            self.run = None
++
++    def add_scalar(self, tag, value, step):
++        self.tb.add_scalar(tag, value, step)
++        if self.run is not None:
++            try:
++                self.run.log({tag: float(value)}, step=int(step))
++            except Exception:
++                self.run = None
++
++    def __getattr__(self, name):
++        return getattr(self.tb, name)
++
++    def close(self):
++        self.tb.close()
++        if self.run is not None:
++            self.run.finish()
+-- 
+2.43.0
+

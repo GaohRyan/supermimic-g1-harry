@@ -1,0 +1,58 @@
+From bc145895e23d80465a2da9b4008cc134e69b649b Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:21:25 -0500
+Subject: [PATCH 8/8] opt: spell out Muon's weight decay 0.1 (the PyTorch
+ default the official release inherits)
+
+---
+ src/supermimic/training/optim.py | 7 ++++++-
+ tests/test_optim.py              | 1 +
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/supermimic/training/optim.py b/src/supermimic/training/optim.py
+index 686fca4..f66d5be 100644
+--- a/src/supermimic/training/optim.py
++++ b/src/supermimic/training/optim.py
+@@ -4,6 +4,9 @@ Default: AdamW with weight_decay 0.0, which is numerically identical to the Adam
+ non-zero weight decay is applied); it is the base for later weight-decay experiments.
+ Option hidden="muon" (ablation, as the official SuperMimic release, learners/learner_utils.py::build_optimizers): Muon on
+ the Linear weights between the first and the last Linear of every nn.Sequential, AdamW on everything else, same lr.
++The official call is torch.optim.Muon(hidden, lr=lr, adjust_lr_fn="match_rms_adamw"): it leaves Muon's weight decay at the
++PyTorch default 0.1 (torch 2.10.0, the version the release locks), so the hidden weights of the official networks ARE
++weight-decayed (p *= 1 - lr * 0.1 per step) while everything else is not. MUON_WEIGHT_DECAY spells that default out.
+ """
+ 
+ from __future__ import annotations
+@@ -11,6 +14,8 @@ from __future__ import annotations
+ import torch
+ import torch.nn as nn
+ 
++MUON_WEIGHT_DECAY = 0.1  # the torch.optim.Muon default the official release inherits
++
+ 
+ class MultiOpt:
+     """Several optimizers behind the small part of the Optimizer interface the trainers use."""
+@@ -59,7 +64,7 @@ def build_optimizer(module: nn.Module, lr: float, betas=(0.9, 0.999), weight_dec
+     adamw = torch.optim.AdamW(rest, lr=lr, betas=betas, weight_decay=weight_decay)
+     if not hid:
+         return adamw
+-    return MultiOpt([adamw, torch.optim.Muon(hid, lr=lr, adjust_lr_fn="match_rms_adamw")])
++    return MultiOpt([adamw, torch.optim.Muon(hid, lr=lr, weight_decay=MUON_WEIGHT_DECAY, adjust_lr_fn="match_rms_adamw")])
+ 
+ 
+ def load_optimizer_state(opt, sd: dict, *, betas=None, weight_decay: float | None = None) -> bool:
+diff --git a/tests/test_optim.py b/tests/test_optim.py
+index c9e4c79..7298b82 100644
+--- a/tests/test_optim.py
++++ b/tests/test_optim.py
+@@ -47,6 +47,7 @@ def test_muon_layout_and_state():
+     opt = build_optimizer(m, 2e-4, hidden="muon")
+     assert isinstance(opt, MultiOpt) and [type(o).__name__ for o in opt.opts] == ["AdamW", "Muon"]
+     assert [tuple(p.shape) for p in hidden_linear_weights(m)] == [(64, 64), (64, 64)]
++    assert opt.opts[1].param_groups[0]["weight_decay"] == 0.1 and opt.opts[0].param_groups[0]["weight_decay"] == 0.0
+     _train(m, opt, 0, 5)
+     assert all(torch.isfinite(p).all() for p in m.parameters())
+     adam_sd = torch.optim.Adam(MLP(20, (64, 64, 64), 7).parameters()).state_dict()
+-- 
+2.43.0
+

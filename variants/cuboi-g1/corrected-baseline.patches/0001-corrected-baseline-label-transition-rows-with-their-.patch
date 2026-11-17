@@ -1,0 +1,248 @@
+From 8e58409a9363322393c821721dccbce9f678e4ea Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 16:24:49 -0500
+Subject: [PATCH 1/6] corrected-baseline: label transition rows with their own
+ state's termination
+
+sample_windows reads done[t+1..t+k] as labels of states 1..k; upstream wrote the
+episode's termination flag on the last transition row (state s_T), labelling s_T
+terminal one step early. Transition rows now carry done=0; only the terminal row
+holding s_{T+1} carries the termination label. Adds a CPU trace test covering a
+real termination, a timeout and the following auto-reset.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/supermimic/data/recorder.py |  20 +++-
+ tests/test_done_labels.py       | 166 ++++++++++++++++++++++++++++++++
+ 2 files changed, 181 insertions(+), 5 deletions(-)
+ create mode 100644 tests/test_done_labels.py
+
+diff --git a/src/supermimic/data/recorder.py b/src/supermimic/data/recorder.py
+index 36313d3..57c0925 100644
+--- a/src/supermimic/data/recorder.py
++++ b/src/supermimic/data/recorder.py
+@@ -65,7 +65,17 @@ class ReplayRecorder(RecorderTerm):
+         self._remember(env_ids)
+         self.ep_start[env_ids] = True
+ 
+-    def _write_rows(self, ids: torch.Tensor, done_next: torch.Tensor) -> None:
++    def _write_rows(self, ids: torch.Tensor) -> None:
++        """Write transition rows (s_t, a_t, ...) for ``ids``.
++
++        ``done`` of a row is the termination label of *that row's own state* s_t, because
++        ``ReplayBuffer.sample_windows`` reads ``done[t+1..t+k]`` as the labels of states 1..k.
++        A transition row's state was continued from, so it is never terminal: label 0. The
++        termination label of s_{T+1} lives only on the terminal row written in
++        ``record_pre_reset`` (corrected-baseline fix; upstream wrote ``terminated`` here, which
++        labelled s_T one step early).
++        """
++        done_own = torch.zeros(ids.numel(), device=self._env.device)
+         env = self._env
+         self.buffer.add(
+             ids,
+@@ -74,10 +84,10 @@ class ReplayRecorder(RecorderTerm):
+             a_exec=self.action_term.executed_raw[ids],
+             xi=self.prev_xi[ids],
+             r=env.reward_buf[ids],
+-            done=done_next,
++            done=done_own,
+             frame=self.prev_frame[ids],
+             clip=self.prev_clip[ids],
+-            terminal=torch.zeros_like(done_next, dtype=torch.bool),
++            terminal=torch.zeros_like(done_own, dtype=torch.bool),
+             ep_start=self.ep_start[ids],
+         )
+         self.ep_start[ids] = False
+@@ -87,7 +97,7 @@ class ReplayRecorder(RecorderTerm):
+             return
+         env = self._env
+         terminated = env.reset_terminated[env_ids].float()
+-        self._write_rows(env_ids, terminated)
++        self._write_rows(env_ids)
+         # Terminal row: the state reached by the last action (no transition out of it).
+         cmd = self.command
+         s_next = self.state_io.read()[env_ids]
+@@ -115,7 +125,7 @@ class ReplayRecorder(RecorderTerm):
+         ids = mask.nonzero().squeeze(-1)
+         if ids.numel() == 0:
+             return
+-        self._write_rows(ids, torch.zeros(ids.numel(), device=env.device))
++        self._write_rows(ids)
+         self._remember(ids)
+ 
+ 
+diff --git a/tests/test_done_labels.py b/tests/test_done_labels.py
+new file mode 100644
+index 0000000..62af17e
+--- /dev/null
++++ b/tests/test_done_labels.py
+@@ -0,0 +1,166 @@
++"""CPU trace test for replay termination labels (corrected-baseline).
++
++Drives the real ``ReplayRecorder`` + ``ReplayBuffer`` with a fake env in mjlab's hook order
++(post_step for non-resetting envs, then pre_reset -> reset -> post_reset) over three cases:
++a real termination, a timeout (truncation), and the auto-reset that follows. It then
++enumerates *every* sampleable k-step window and checks that ``done[j]`` is 1 exactly when
++state j+1 of the window is the post-termination state s_{T+1} of a terminated episode.
++
++mjlab is stubbed so this runs without a GPU or simulator.
++"""
++from __future__ import annotations
++
++import sys
++import types
++
++import pytest
++import torch
++
++
++def _stub_mjlab():
++    try:
++        import mjlab.managers.recorder_manager  # noqa: F401  real mjlab available (GPU image)
++        return
++    except ImportError:
++        pass
++    # CPU-only: bypass supermimic.envs.__init__ (it imports the mjlab env stack).
++    import importlib.util
++    from pathlib import Path
++
++    import supermimic
++
++    envs = types.ModuleType("supermimic.envs")
++    envs.__path__ = [str(Path(supermimic.__file__).parent / "envs")]
++    sys.modules["supermimic.envs"] = envs
++    assert importlib.util.find_spec("supermimic.envs.state_io") is not None
++    rm = types.ModuleType("mjlab.managers.recorder_manager")
++
++    class RecorderTerm:
++        def __init__(self, cfg, env):
++            self.cfg, self._env = cfg, env
++
++    class RecorderTermCfg:
++        pass
++
++    rm.RecorderTerm, rm.RecorderTermCfg = RecorderTerm, RecorderTermCfg
++    for name in ("mjlab", "mjlab.managers"):
++        sys.modules.setdefault(name, types.ModuleType(name))
++    sys.modules["mjlab.managers.recorder_manager"] = rm
++
++
++_stub_mjlab()
++from supermimic.data import recorder as rec_mod  # noqa: E402
++from supermimic.envs.sim_context import XI_DIM  # noqa: E402
++from supermimic.envs.state_io import STATE_DIM  # noqa: E402
++
++E, A = 3, 29
++
++
++class FakeEnv:
++    """State = [episode_tag, step_in_episode, env_id, 0...]; env 0 terminates, env 1 times out, env 2 continues."""
++
++    def __init__(self):
++        self.num_envs, self.device = E, torch.device("cpu")
++        self.ep = torch.zeros(E)
++        self.t = torch.zeros(E)
++        self.reward_buf = torch.zeros(E)
++        self.reset_buf = torch.zeros(E, dtype=torch.bool)
++        self.reset_terminated = torch.zeros(E, dtype=torch.bool)
++        act = types.SimpleNamespace(executed_raw=torch.zeros(E, A))
++        self.action_manager = types.SimpleNamespace(action=torch.zeros(E, A), get_term=lambda n: act)
++        lib = types.SimpleNamespace(frame_clip=torch.zeros(10_000, dtype=torch.long))
++        self.cmd = types.SimpleNamespace(frame=torch.zeros(E, dtype=torch.long), library=lib)
++        self.command_manager = types.SimpleNamespace(get_term=lambda n: self.cmd)
++
++    def state(self):
++        s = torch.zeros(E, STATE_DIM)
++        s[:, 0], s[:, 1], s[:, 2] = self.ep, self.t, torch.arange(E, dtype=torch.float32)
++        return s
++
++
++class FakeStateIO:
++    def __init__(self, env):
++        self.env = env
++
++    def read(self):
++        return self.env.state()
++
++
++class FakeCtx:
++    def __init__(self, env, *a, **k):
++        self.env = env
++
++    def read(self):
++        return torch.zeros(E, XI_DIM)
++
++
++@pytest.fixture
++def trace(monkeypatch):
++    monkeypatch.setattr(rec_mod, "StateIO", FakeStateIO)
++    monkeypatch.setattr(rec_mod, "SimContext", FakeCtx)
++    env = FakeEnv()
++    cfg = types.SimpleNamespace(params={"capacity": 64, "foot_geom_regex": "x"})
++    rec = rec_mod.ReplayRecorder(cfg, env)
++    rec.record_post_reset(torch.arange(E))
++    terminal_states = set()  # (ep_tag, step, env) of s_{T+1} for *terminated* episodes
++    end_step = {0: 3, 1: 3}  # env -> step index at which s_{T+1} is reached
++    for _ in range(7):
++        env.t += 1
++        env.cmd.frame += 1
++        env.reward_buf = torch.full((E,), 0.1)
++        ended = torch.tensor([int(env.t[i]) == end_step.get(i, -1) for i in range(E)])
++        env.reset_buf = ended.clone()
++        env.reset_terminated = ended & (torch.arange(E) == 0)  # env 1 is a timeout
++        rec.record_post_step()
++        ids = ended.nonzero().squeeze(-1)
++        if ids.numel():
++            for i in ids.tolist():
++                if env.reset_terminated[i]:
++                    terminal_states.add((float(env.ep[i]), float(env.t[i]), float(i)))
++            rec.record_pre_reset(ids)
++            env.ep[ids] += 1  # auto-reset: new episode tag, step 0
++            env.t[ids] = 0
++            end_step.update({i: 3 for i in ids.tolist()})
++            rec.record_post_reset(ids)
++    return rec.buffer, terminal_states
++
++
++def _all_windows(buf, k):
++    mask = buf.window_mask(k)
++    e, t = mask.nonzero(as_tuple=True)
++    buf._sample_from_mask = lambda m, n: (e, t)  # deterministic: every sampleable window
++    return buf.sample_windows(int(e.numel()), k)
++
++
++@pytest.mark.parametrize("k", [1, 2, 3])
++def test_done_label_marks_only_post_termination_state(trace, k):
++    buf, terminal_states = trace
++    assert terminal_states, "trace must contain a real termination"
++    w = _all_windows(buf, k)
++    n = w.states.shape[1]
++    assert n > 0
++    hits = 0
++    for j in range(k):
++        for c in range(n):
++            s = w.states[j + 1, c]
++            key = (float(s[0]), float(s[1]), float(s[2]))
++            expected = 1.0 if key in terminal_states else 0.0
++            hits += expected
++            assert float(w.done[j, c]) == expected, (k, j, key, float(w.done[j, c]))
++    assert hits > 0, "at least one window must end on the terminated state"
++
++
++def test_timeout_and_autoreset_rows(trace):
++    buf, _ = trace
++    rows = buf.valid.nonzero(as_tuple=True)
++    s, done, term = buf.s[rows], buf.done[rows], buf.terminal[rows]
++    # timeout terminal rows (env 1) carry done=0; terminated terminal rows (env 0) carry done=1
++    for i in range(s.shape[0]):
++        env = int(rows[0][i])
++        if bool(term[i]):
++            assert float(done[i]) == (1.0 if env == 0 else 0.0)
++        else:
++            assert float(done[i]) == 0.0, "transition rows are never terminal"
++    # auto-reset starts a new episode id; windows never cross it
++    w = _all_windows(buf, 3)
++    assert torch.all(w.states[0, :, 0] == w.states[-1, :, 0])
+-- 
+2.43.0
+

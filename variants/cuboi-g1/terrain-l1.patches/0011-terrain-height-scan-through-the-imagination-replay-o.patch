@@ -1,0 +1,358 @@
+From 7292e9bad2edf25d38a0bf4b358ec6857da27bc3 Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:14:48 -0500
+Subject: [PATCH 11/19] terrain: height scan through the imagination (replay
+ origin, compiled step, rollout, critic); root-height feature measured from
+ the mean terrain under the body
+
+Every replay row carries the env origin of its episode, so the scan of a stored or imagined state can be looked up
+from the global height map. The imagined rollout re-queries the scan at every predicted state; the actor sees a
+noisy copy, the world model and the critic the clean one.
+
+Checked locally with the line G session-3 checkpoint (expanded networks): on a flat map the rollout equals the
+flat-ground code path under the same seed (max reward difference 1.5e-8, states identical); on the generated
+20 cm pyramid the rollout, the lifted rewards and the backward pass run and the gradient reaches the new scan
+columns of the decoder.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ src/supermimic/data/replay_buffer.py         | 13 +++++++++-
+ src/supermimic/imagination/compiled.py       | 26 +++++++++++++------
+ src/supermimic/imagination/policy_trainer.py | 19 ++++++++++----
+ src/supermimic/imagination/rollout.py        | 27 +++++++++++++++++---
+ src/supermimic/world_model/hard_mining.py    |  4 +--
+ src/supermimic/world_model/wm_trainer.py     |  6 ++---
+ src/supermimic/world_model/world_model.py    | 10 +++++---
+ 7 files changed, 79 insertions(+), 26 deletions(-)
+
+diff --git a/src/supermimic/data/replay_buffer.py b/src/supermimic/data/replay_buffer.py
+index 28739ae..dfbc31d 100644
+--- a/src/supermimic/data/replay_buffer.py
++++ b/src/supermimic/data/replay_buffer.py
+@@ -24,6 +24,7 @@ class WindowBatch:
+     reward: torch.Tensor  # (k, n)
+     done: torch.Tensor  # (k, n) termination label of states 1..k
+     frame: torch.Tensor  # (k, n) target frame of each transition
++    origin: torch.Tensor | None = None  # (n, 3) env origin of the episode the window comes from (terrain lookups)
+ 
+ 
+ @dataclass
+@@ -34,6 +35,7 @@ class StartBatch:
+     prev_action: torch.Tensor  # (n, A) clean action of the previous step (0 at episode start)
+     hist_states: torch.Tensor  # (hist, n, S) states s_{t-hist+1..t} (backfilled at episode start)
+     hist_actions: torch.Tensor  # (hist, n, A) clean actions a_{t-hist..t-1} aligned with hist_states' obs
++    origin: torch.Tensor | None = None  # (n, 3) env origin of the episode (terrain lookups)
+ 
+ 
+ class ReplayBuffer:
+@@ -48,6 +50,9 @@ class ReplayBuffer:
+         self.xi = f(xi_dim)
+         self.r = f()
+         self.done = f()
++        # Env origin of the row's episode: states are stored relative to it, terrain lookups need it back. It is
++        # constant inside an episode (the terrain curriculum moves an env only at a reset).
++        self.origin = f(3)
+         self.frame = torch.zeros(E, T, dtype=torch.long, device=self.device)
+         self.clip = torch.zeros(E, T, dtype=torch.long, device=self.device)
+         self.ep_id = torch.full((E, T), -1, dtype=torch.long, device=self.device)
+@@ -62,8 +67,12 @@ class ReplayBuffer:
+     # ------------------------------------------------------------------ writes
+ 
+     @torch.no_grad()
+-    def add(self, env_ids, s, a, a_exec, xi, r, done, frame, clip, terminal, ep_start) -> None:
++    def add(self, env_ids, s, a, a_exec, xi, r, done, frame, clip, terminal, ep_start, origin=None) -> None:
+         p = self.ptr[env_ids]
++        if origin is not None:
++            self.origin[env_ids, p] = origin
++        else:
++            self.origin[env_ids, p] = 0.0
+         self.s[env_ids, p] = s
+         self.a[env_ids, p] = a
+         self.a_exec[env_ids, p] = a_exec
+@@ -144,6 +153,7 @@ class ReplayBuffer:
+             reward=self.r[ee[:-1], tt[:-1]],
+             done=self.done[ee[1:], tt[1:]],
+             frame=self.frame[ee[:-1], tt[:-1]],
++            origin=self.origin[e, t],
+         )
+ 
+     @torch.no_grad()
+@@ -174,4 +184,5 @@ class ReplayBuffer:
+             prev_action=hist_actions[-1],
+             hist_states=hist_states,
+             hist_actions=hist_actions,
++            origin=self.origin[e, t],
+         )
+diff --git a/src/supermimic/imagination/compiled.py b/src/supermimic/imagination/compiled.py
+index 6c74a73..fa0c656 100644
+--- a/src/supermimic/imagination/compiled.py
++++ b/src/supermimic/imagination/compiled.py
+@@ -22,6 +22,8 @@ REWARD_TERM_NAMES = (
+     "motion_body_ang_vel",
+     "action_rate_l2",
+     "joint_limit",
++    "foot_clearance",
++    "progress",
+ )
+ 
+ 
+@@ -34,18 +36,26 @@ class ImagStep:
+             mode = None if compile_mode == "default" else compile_mode
+             self._fn = torch.compile(self._step, mode=mode, dynamic=False)
+ 
+-    def _step(self, s, a, a_exec, a_prev, xi, ref_body_pos, ref_body_quat, ref_body_lin, ref_body_ang, ref_root_pos, ref_root_quat):
++    def _step(self, s, a, a_exec, a_prev, xi, ref_body_pos, ref_body_quat, ref_body_lin, ref_body_ang, ref_root_pos, ref_root_quat, scan, origin):
++        """``scan``: height scan of s (terrain model) or None (flat-ground model); ``origin``: env origin of the rows.
++        Returns also the scan and the base lift of s_next (None, None for a flat-ground model)."""
+         ref = ReferenceFrame(ref_body_pos, ref_body_quat, ref_body_lin, ref_body_ang, ref_root_pos, ref_root_quat)
+-        s_next = self.wm.step(s, a_exec, xi)  # a_exec = a unless an action delay is simulated
++        s_next = self.wm.step(s, a_exec, xi, scan=scan, origin=origin)  # a_exec = a unless an action delay is simulated
+         bodies = self.wm.heads.robot_bodies(s_next)
+-        terms = self.wm.heads.reward(s_next, a, a_prev, ref, bodies)
++        if scan is not None:
++            scan_next = self.wm.scan(s_next, origin)
++            lift = self.wm.base_lift(s_next, scan_next)
++            ground_fn = self.wm.ground_fn(origin)
++        else:
++            scan_next, lift, ground_fn = None, None, None
++        terms = self.wm.heads.reward(s_next, a, a_prev, ref, bodies, base_lift=lift, ground_fn=ground_fn)
+         r = terms["total"]
+-        term_vec = torch.stack([terms[k] for k in REWARD_TERM_NAMES], dim=0)  # (8, n)
+-        logits = self.wm.termination_logits(s_next, ref)
++        term_vec = torch.stack([terms[k] for k in REWARD_TERM_NAMES], dim=0)  # (10, n)
++        logits = self.wm.termination_logits(s_next, ref, lift)
+         obs_clean = analytic_observation(s_next, a, xi, self.q0)
+         ai = self.wm.heads.anchor_index
+         anchor_pose = torch.cat([bodies["pos"][..., ai, :], bodies["quat"][..., ai, :]], dim=-1)  # (n, 7)
+-        return s_next, r, term_vec, logits, obs_clean, anchor_pose
++        return s_next, r, term_vec, logits, obs_clean, anchor_pose, scan_next, lift
+ 
+-    def __call__(self, s, a, a_prev, xi, ref: ReferenceFrame, a_exec=None):
+-        return self._fn(s, a, a if a_exec is None else a_exec, a_prev, xi, ref.body_pos_w, ref.body_quat_w, ref.body_lin_vel_w, ref.body_ang_vel_w, ref.root_pos_w, ref.root_quat_w)
++    def __call__(self, s, a, a_prev, xi, ref: ReferenceFrame, a_exec=None, scan=None, origin=None):
++        return self._fn(s, a, a if a_exec is None else a_exec, a_prev, xi, ref.body_pos_w, ref.body_quat_w, ref.body_lin_vel_w, ref.body_ang_vel_w, ref.root_pos_w, ref.root_quat_w, scan, origin)
+diff --git a/src/supermimic/imagination/policy_trainer.py b/src/supermimic/imagination/policy_trainer.py
+index 47c7690..91b1c1b 100644
+--- a/src/supermimic/imagination/policy_trainer.py
++++ b/src/supermimic/imagination/policy_trainer.py
+@@ -40,6 +40,7 @@ class PolicyTrainerCfg:
+     anchor_obs_mode: str = "full"  # set from env.anchor_obs_mode by the Trainer
+     goal_contract: str = "cuboi"  # set from env.goal_contract by the Trainer
+     action_delay_max: int = 0  # set from env.action_delay_max by the Trainer
++    scan_noise: float = 0.0  # set from env.scan_noise by the Trainer: half width of the uniform noise on the actor's height scan
+ 
+ 
+ class PolicyTrainer:
+@@ -60,8 +61,13 @@ class PolicyTrainer:
+             g["lr"] = lr
+ 
+     def _critic_inputs(self, ro: ImagRollout):
++        """Canonical state features (root height measured from the terrain on a terrain run), goal, root error."""
+         H1, n, _ = ro.states.shape
+-        feat = self.wm.spec.canonical(ro.states.reshape(H1 * n, -1)).reshape(H1, n, -1)
++        if ro.scans is not None:
++            feat, _ = self.wm.features(ro.states.reshape(H1 * n, -1), ro.scans.reshape(H1 * n, -1))
++            feat = feat.reshape(H1, n, -1)
++        else:
++            feat = self.wm.spec.canonical(ro.states.reshape(H1 * n, -1)).reshape(H1, n, -1)
+         return feat, ro.goals, ro.e_root
+ 
+     def update(self, buffer: ReplayBuffer, xi_norm_fn=None) -> dict[str, float]:
+@@ -72,10 +78,10 @@ class PolicyTrainer:
+         # ---- actor: BPTT through the frozen world model ------------------------------------
+         self.wm.requires_grad_(False)
+         self.critic.requires_grad_(False)
+-        ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, cfg.future_frames, obs_noise=cfg.obs_noise, step_fn=self.step_fn, anchor_obs=cfg.anchor_obs, anchor_obs_mode=cfg.anchor_obs_mode, goal_contract=cfg.goal_contract, action_delay_max=cfg.action_delay_max)
++        ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, cfg.future_frames, obs_noise=cfg.obs_noise, step_fn=self.step_fn, anchor_obs=cfg.anchor_obs, anchor_obs_mode=cfg.anchor_obs_mode, goal_contract=cfg.goal_contract, action_delay_max=cfg.action_delay_max, scan_noise=cfg.scan_noise)
+         feat, goals, e_root = self._critic_inputs(ro)
+         if cfg.use_critic:
+-            v_H = self.critic(feat[-1], goals[-1], xi_norm, e_root[-1])
++            v_H = self.critic(feat[-1], goals[-1], xi_norm, e_root[-1], ro.scans[-1] if ro.scans is not None else None)
+         else:
+             v_H = None
+         J = policy_objective(ro, v_H, cfg.gamma)
+@@ -107,12 +113,15 @@ class PolicyTrainer:
+                 feat_d, goals_d, e_root_d = feat.detach(), goals.detach(), e_root.detach()
+                 H1, n, _ = feat_d.shape
+                 xi_rep = xi_norm[None].expand(H1, n, -1)
+-                values = self.critic(feat_d.reshape(H1 * n, -1), goals_d.reshape(H1 * n, -1), xi_rep.reshape(H1 * n, -1), e_root_d.reshape(H1 * n, -1)).reshape(H1, n)
++                scans_d = ro.scans.detach() if ro.scans is not None else None
++                values = self.critic(feat_d.reshape(H1 * n, -1), goals_d.reshape(H1 * n, -1), xi_rep.reshape(H1 * n, -1), e_root_d.reshape(H1 * n, -1),
++                                     scans_d.reshape(H1 * n, -1) if scans_d is not None else None).reshape(H1, n)
+                 targets = gae_targets(ro.rewards.detach(), ro.dhat[1:].detach(), values, cfg.gamma, cfg.gae_lambda)  # (H, n)
+                 X_feat = feat_d[:-1].reshape(-1, feat_d.shape[-1])
+                 X_goal = goals_d[:-1].reshape(-1, goals_d.shape[-1])
+                 X_xi = xi_rep[:-1].reshape(-1, xi_rep.shape[-1])
+                 X_er = e_root_d[:-1].reshape(-1, 4)
++                X_scan = scans_d[:-1].reshape(-1, scans_d.shape[-1]) if scans_d is not None else None
+                 Y = targets.reshape(-1)
+             N = Y.shape[0]
+             mb = N // cfg.critic_minibatches
+@@ -121,7 +130,7 @@ class PolicyTrainer:
+                 perm = torch.randperm(N, device=Y.device)
+                 for i in range(cfg.critic_minibatches):
+                     idx = perm[i * mb : (i + 1) * mb]
+-                    pred = self.critic(X_feat[idx], X_goal[idx], X_xi[idx], X_er[idx])
++                    pred = self.critic(X_feat[idx], X_goal[idx], X_xi[idx], X_er[idx], X_scan[idx] if X_scan is not None else None)
+                     closs = torch.nn.functional.mse_loss(pred, Y[idx])
+                     self.critic_opt.zero_grad(set_to_none=True)
+                     closs.backward()
+diff --git a/src/supermimic/imagination/rollout.py b/src/supermimic/imagination/rollout.py
+index 1b1d856..759f101 100644
+--- a/src/supermimic/imagination/rollout.py
++++ b/src/supermimic/imagination/rollout.py
+@@ -30,6 +30,7 @@ class ImagRollout:
+     e_root: torch.Tensor  # (H+1, n, 4)
+     frames: torch.Tensor  # (H+1, n)
+     reward_terms: dict  # mean of each reward term over the rollout (diagnostics)
++    scans: torch.Tensor | None = None  # (H+1, n, 187) noise-free height scan of every state (terrain model only)
+ 
+ 
+ def imagine(
+@@ -45,6 +46,7 @@ def imagine(
+     anchor_obs_mode: str = "full",
+     goal_contract: str = "cuboi",
+     action_delay_max: int = 0,
++    scan_noise: float = 0.0,
+ ) -> ImagRollout:
+     device = start.state.device
+     n = start.state.shape[0]
+@@ -94,13 +96,28 @@ def imagine(
+         return ReferenceFrame(ref_all.body_pos_w[sl], ref_all.body_quat_w[sl], ref_all.body_lin_vel_w[sl], ref_all.body_ang_vel_w[sl], ref_all.root_pos_w[sl], ref_all.root_quat_w[sl])
+ 
+     ref = ref_at(0)
++    # Terrain: the scan of every imagined state is looked up again from the predicted pose (the terrain is static and
++    # known, it is not predicted). The actor sees a noisy copy, the world model and the critic the clean one.
++    use_scan = wm.cfg.scan_dim > 0
++    origin = start.origin if use_scan else None
++    scan = wm.scan(s, origin) if use_scan else None
++    lift = wm.base_lift(s, scan) if use_scan else None
++    policy_scan = policy.cfg.scan_mode != "none"
++    assert use_scan or not policy_scan, "a policy with a scan input needs a terrain world model"
++
++    def noisy_scan(x):
++        if not policy_scan:
++            return None
++        return x + (torch.rand_like(x) * 2 - 1) * scan_noise if (obs_noise and scan_noise > 0) else x
++
++    scans = [scan]
+     if anchor_obs:
+         b0 = wm.heads.robot_bodies(s)
+         anchor_pose = torch.cat([b0["pos"][..., ai, :], b0["quat"][..., ai, :]], dim=-1)
+     else:
+         anchor_pose = None
+     goals = [make_goal(frame, ref, anchor_pose)]
+-    e_roots = [wm.heads.root_error_features(s, ref)]
++    e_roots = [wm.heads.root_error_features(s, ref, lift)]
+     term_sum = torch.zeros(len(REWARD_TERM_NAMES), device=device)
+ 
+     if action_delay_max > 0:
+@@ -108,14 +125,14 @@ def imagine(
+         past = [start.hist_actions[-1 - i] for i in range(action_delay_max)]  # a_{t-1}, a_{t-2}, ...
+     for t in range(horizon):
+         obs_flat = flatten_history_term_major(torch.stack(hist, 0))
+-        a = policy(obs_flat, goals[-1])
++        a = policy(obs_flat, goals[-1], scan=noisy_scan(scan))
+         if action_delay_max > 0:  # the world model is fed the action computed d steps ago (d per rollout row)
+             past.insert(0, a)
+             del past[action_delay_max + 1 :]
+             a_exec = torch.stack(past, 0)[delay, torch.arange(n, device=device)]
+         else:
+             a_exec = None
+-        s_next, r, term_vec, logits, obs_clean, anchor_pose = step_fn(s, a, a_prev, start.xi, ref, a_exec)
++        s_next, r, term_vec, logits, obs_clean, anchor_pose, scan, lift = step_fn(s, a, a_prev, start.xi, ref, a_exec, scan, origin)
+         d = torch.sigmoid(logits)
+         c = c * (1.0 - d)
+         term_sum += term_vec.detach().mean(-1)
+@@ -131,8 +148,9 @@ def imagine(
+         dhats.append(d)
+         survivals.append(c)
+         goals.append(make_goal(frame, ref, anchor_pose))
+-        e_roots.append(wm.heads.root_error_features(s, ref))
++        e_roots.append(wm.heads.root_error_features(s, ref, lift))
+         frames.append(frame)
++        scans.append(scan)
+ 
+     return ImagRollout(
+         states=torch.stack(states),
+@@ -144,4 +162,5 @@ def imagine(
+         e_root=torch.stack(e_roots),
+         frames=torch.stack(frames),
+         reward_terms={k: float(v / horizon) for k, v in zip(REWARD_TERM_NAMES, term_sum.tolist())},
++        scans=torch.stack(scans) if use_scan else None,
+     )
+diff --git a/src/supermimic/world_model/hard_mining.py b/src/supermimic/world_model/hard_mining.py
+index cc366f1..38357ee 100644
+--- a/src/supermimic/world_model/hard_mining.py
++++ b/src/supermimic/world_model/hard_mining.py
+@@ -13,13 +13,13 @@ import torch
+ 
+ 
+ @torch.no_grad()
+-def window_error(wm, states: torch.Tensor, a_exec: torch.Tensor, xi: torch.Tensor) -> torch.Tensor:
++def window_error(wm, states: torch.Tensor, a_exec: torch.Tensor, xi: torch.Tensor, origin: torch.Tensor | None = None) -> torch.Tensor:
+     """Mean open-loop normalised squared error over the window, per sample (n,). states (k+1,n,S), a_exec (k,n,A)."""
+     k = a_exec.shape[0]
+     s = states[0]
+     err = torch.zeros(states.shape[1], device=states.device)
+     for j in range(k):
+-        s = wm.step(s, a_exec[j], xi)
++        s = wm.step(s, a_exec[j], xi, origin=origin)
+         err = err + wm.spec.normalized_sq_error(s, states[j + 1])
+     return torch.nan_to_num(err / k, nan=0.0, posinf=1.0e3).clamp(0.0, 1.0e3)
+ 
+diff --git a/src/supermimic/world_model/wm_trainer.py b/src/supermimic/world_model/wm_trainer.py
+index 3e9d3ef..6cb09ed 100644
+--- a/src/supermimic/world_model/wm_trainer.py
++++ b/src/supermimic/world_model/wm_trainer.py
+@@ -55,7 +55,7 @@ class WorldModelTrainer:
+         # Only the root pose of the references is needed for the termination features.
+         r = self.lib.ref(w.frame.reshape(-1))
+         refs = [ReferenceFrame(None, None, None, None, r.root_pos_w[j * n : (j + 1) * n], r.root_quat_w[j * n : (j + 1) * n]) for j in range(k)]
+-        return self.wm.window_loss(w.states, w.a_exec, w.xi, w.done, refs)
++        return self.wm.window_loss(w.states, w.a_exec, w.xi, w.done, refs, w.origin if self.wm.has_terrain else None)
+ 
+     def update(self, buffer: ReplayBuffer) -> dict[str, float]:
+         agg: dict[str, torch.Tensor] = {}
+@@ -66,7 +66,7 @@ class WorldModelTrainer:
+                 ks = self.cfg.hard_score_steps
+                 e, t = buffer.sample_window_indices(self.cfg.batch_size * self.cfg.hard_candidates, self.cfg.window)
+                 c = buffer.windows_at(e, t, ks)
+-                err = window_error(self.wm, c.states, c.a_exec, c.xi)
++                err = window_error(self.wm, c.states, c.a_exec, c.xi, c.origin if self.wm.has_terrain else None)
+                 idx = mine_indices(err, self.cfg.batch_size, self.cfg.hard_ratio, self.cfg.hard_alpha)
+                 w = buffer.windows_at(e[idx], t[idx], self.cfg.window)
+                 mined = (err.mean(), err[idx].mean())
+@@ -91,4 +91,4 @@ class WorldModelTrainer:
+     def online_error(self, buffer: ReplayBuffer, n: int = 1024, k: int = 8) -> torch.Tensor:
+         """k-step open-loop error on (recent) replay windows; (k,) tensor."""
+         w = buffer.sample_windows(n, k)
+-        return self.wm.rollout_error(w.states, w.a_exec, w.xi)
++        return self.wm.rollout_error(w.states, w.a_exec, w.xi, w.origin if self.wm.has_terrain else None)
+diff --git a/src/supermimic/world_model/world_model.py b/src/supermimic/world_model/world_model.py
+index f846e81..d24137d 100644
+--- a/src/supermimic/world_model/world_model.py
++++ b/src/supermimic/world_model/world_model.py
+@@ -88,12 +88,16 @@ class WorldModel(nn.Module):
+         return lambda xy: self.terrain.height(xy + origin[..., None, :2])
+ 
+     def features(self, s: torch.Tensor, scan: torch.Tensor | None):
+-        """Network inputs of state s: canonical features with the root height measured from the terrain under the
+-        root, and the normalised scan. On flat ground the canonical features are those of the flat-ground model."""
++        """Network inputs of state s: canonical features with the root height measured from the mean terrain height
++        under the body (the same base lift that raises the reference and the termination height), and the normalised
++        scan. On flat ground the canonical features are those of the flat-ground model.
++
++        The mean over the 0.6 x 0.4 m patch is used rather than the single cell under the root: that cell jumps by a
++        whole riser when the pelvis crosses a step edge, the patch mean moves by a seventh of it."""
+         feat = self.spec.canonical(s)
+         if scan is None:
+             return feat, None
+-        ground = (s[..., 2] - scan[..., self.centre_index]).detach()
++        ground = self.base_lift(s, scan)
+         feat = torch.cat([feat[..., :1] - (ground / self.spec.in_scale[0])[..., None], feat[..., 1:]], dim=-1)
+         return feat, (scan - SCAN_OFFSET) / SCAN_SCALE
+ 
+-- 
+2.43.0
+

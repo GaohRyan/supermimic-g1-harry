@@ -1,0 +1,34 @@
+{
+ "project_id": "cuboi-g1",
+ "line": "opt",
+ "base_repo": "https://github.com/CuboiLeo/SuperMimic-Reproduced.git",
+ "base_commit": "ba6105349069bf040f1fdad60873d13138d505a2",
+ "parent_variant": "sim2real-dr",
+ "branch": "opt/sampler-clipend-norm",
+ "variant_commit": "7ed870044b1d8efcf94ff0af66d1df03381879bb",
+ "variant_tree": "62b8dc135fe158ce240c3cb498169d954f25b696",
+ "summary": "sim2real-dr + reset sampler fix: return-to-go of episodes that end without failure is horizon-normalised (flag env.sampler_clip_end_norm), so the last bins of each clip are no longer read as the hardest",
+ "patches": [
+  {
+   "file": "0001-opt-anchor_obs_mode-ori-reference-anchor-orientation.patch",
+   "sha256": "8347bb74afdd0b319a3a9ee5556711f213ae59ecc9d4b04393c69c2b5b9abe2a",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0002-repro-goal_contract-official-actor-goal-layout-and-a.patch",
+   "sha256": "c38c351e03ca333ebd69e082d2c795519e68aa63e467b5c4ad3598e268fb4a77",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0003-opt-sim-to-real-randomisation-action-delay-armature-.patch",
+   "sha256": "dbe7bc557d9a4e2685f3a337b8c54a10da3ae3d5784df1f4831b05c5fa16961b",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  },
+  {
+   "file": "0004-opt-reset-sampler-uses-horizon-normalised-return-to-.patch",
+   "sha256": "82e7e42b85804e4b86a52ea95652203bc67d4ade186b344817b277fbc75e4d44",
+   "applies_on": "corrected-baseline @ bf237d7, in order"
+  }
+ ],
+ "note_public": "Patch author lines were normalised for publication; variant_tree is unchanged, commit SHAs after git am differ."
+}

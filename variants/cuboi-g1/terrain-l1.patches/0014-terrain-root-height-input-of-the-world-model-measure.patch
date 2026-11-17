@@ -1,0 +1,52 @@
+From eed1c7b3498a4bf8f7c32b89f5633643b1367bce Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:13:01 -0500
+Subject: [PATCH 14/19] terrain: root-height input of the world model measured
+ from the cell under the root again (measured on stair data)
+
+The earlier change to the patch mean was made on an argument (the single cell jumps by a riser when the pelvis crosses
+an edge), not on data. On replay recorded on the generated stairs (flat-ground policy, risers 5-15 cm, 2110 windows)
+the warm-started world model has a median one-step error of 0.006 with the cell (flat tiles: 0.005) and 0.025 with
+the patch mean; the mean errors are the same (0.11 / 0.13). The reference lift and the termination height keep the
+patch mean.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ src/supermimic/world_model/world_model.py | 18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/src/supermimic/world_model/world_model.py b/src/supermimic/world_model/world_model.py
+index acb9872..5eda1a1 100644
+--- a/src/supermimic/world_model/world_model.py
++++ b/src/supermimic/world_model/world_model.py
+@@ -89,16 +89,20 @@ class WorldModel(nn.Module):
+         return lambda xy: self.terrain.height(xy + origin[..., None, :2])
+ 
+     def features(self, s: torch.Tensor, scan: torch.Tensor | None):
+-        """Network inputs of state s: canonical features with the root height measured from the mean terrain height
+-        under the body (the same base lift that raises the reference and the termination height), and the normalised
+-        scan. On flat ground the canonical features are those of the flat-ground model.
+-
+-        The mean over the 0.6 x 0.4 m patch is used rather than the single cell under the root: that cell jumps by a
+-        whole riser when the pelvis crosses a step edge, the patch mean moves by a seventh of it."""
++        """Network inputs of state s: canonical features with the root height measured from the terrain directly under
++        the root, and the normalised scan. On flat ground the canonical features are those of the flat-ground model.
++
++        Which ground the root height is measured from only matters until the model has learned to read the scan (the
++        scan columns start at zero). Measured on recorded stair data with the warm-started model (risers 5-15 cm, 2110
++        windows): the cell under the root gives a median one-step error of 0.006, the flat-ground level (0.005); the mean
++        over the 0.6 x 0.4 m patch gives 0.025, because it is off by up to half a riser whenever the robot stands on a
++        step; the absolute height gives 7.9. The cell jumps by a riser when the pelvis crosses an edge; the means of the
++        errors, which those moments and the falls dominate, are the same for both (0.11 / 0.13). The reference height
++        and the termination keep the smooth patch mean (``base_lift``)."""
+         feat = self.spec.canonical(s)
+         if scan is None:
+             return feat, None
+-        ground = self.base_lift(s, scan)
++        ground = (s[..., 2] - scan[..., self.centre_index]).detach()
+         feat = torch.cat([feat[..., :1] - (ground / self.spec.in_scale[0])[..., None], feat[..., 1:]], dim=-1)
+         return feat, (scan - SCAN_OFFSET) / SCAN_SCALE
+ 
+-- 
+2.43.0
+

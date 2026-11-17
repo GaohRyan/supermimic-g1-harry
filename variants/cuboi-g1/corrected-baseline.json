@@ -1,0 +1,39 @@
+{
+ "project_id": "cuboi-g1",
+ "line": "repro",
+ "base_repo": "https://github.com/CuboiLeo/SuperMimic-Reproduced.git",
+ "base_commit": "ba6105349069bf040f1fdad60873d13138d505a2",
+ "variant_commit": "bf237d72a4875da6039116a638c1c9086a6bad6b",
+ "patches": [
+  {
+   "file": "0001-corrected-baseline-label-transition-rows-with-their-.patch",
+   "sha256": "73c5a9e434545587e789d7662d5051d813bf3f24993e99a681aff082a8a91b14"
+  },
+  {
+   "file": "0002-corrected-baseline-full-clip-nominal-eval-that-saves.patch",
+   "sha256": "ce3878ad74ac0f824e3e5a61623bad15b7226926a52fcfa8f1c1158d6842dab9"
+  },
+  {
+   "file": "0003-eval_fullclip_traj-planned-steps-clip-frames-matches.patch",
+   "sha256": "5e40c57c51cf684fcd154275dec5d72afbf7122021cd952b116fceedd556e7ea"
+  },
+  {
+   "file": "0004-training-opt-in-W-B-mirror-of-TensorBoard-scalars-SM.patch",
+   "sha256": "1b4bd9dbc94a2b5b33ff567d48c9afeeacb5eaf42eb805b3cb050bcbd413b45b"
+  },
+  {
+   "file": "0005-eval-reset-every-pending-env-under-auto_reset-False-.patch",
+   "sha256": "2897c8390dac1c38e0a9f4bc2d2fa870254f17c177e87db6eafc2d7587af1239"
+  },
+  {
+   "file": "0006-eval-window10s-mode-window-steps-protocol-ids-v2.patch",
+   "sha256": "bbee2aef4400a5806505d06d6bda5ced53a684a0cf6527ffde44cb1c2ae32892"
+  },
+  {
+   "file": "0007-eval-robust-v1-protocol-flags-sensor-action-noise-DR.patch",
+   "sha256": "f230de9d036dd75bc2bdf9feb1353693670afddaed4dea0b5824c127686b0757"
+  }
+ ],
+ "variant_tree": "1c03602e9e60271ee8f63e8485fb0e67c5365211",
+ "note_public": "Patch author lines were normalised for publication; variant_tree is unchanged, commit SHAs after git am differ."
+}

@@ -1,0 +1,39 @@
+From 76153021c2da6c04f976aee340710d16f1de2b62 Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:24:21 -0500
+Subject: [PATCH 15/19] terrain: SM_WARN_OVERFLOW=1 keeps MuJoCo-Warp's contact
+ / constraint buffer overflow message on
+
+The flat task silences it; the terrain check on the Pod turns it on to see whether nconmax 70 / njmax 600 are enough
+for a robot on box stairs.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ src/supermimic/envs/tracking_env_cfg.py | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/supermimic/envs/tracking_env_cfg.py b/src/supermimic/envs/tracking_env_cfg.py
+index e13cb6c..7cb8816 100644
+--- a/src/supermimic/envs/tracking_env_cfg.py
++++ b/src/supermimic/envs/tracking_env_cfg.py
+@@ -42,11 +42,15 @@ from supermimic.terrain.terrain_cfg import TerrainArgs, make_terrain_generator_c
+ 
+ class QuietSimulationCfg(SimulationCfg):
+     """SimulationCfg that disables MuJoCo Warp's per-step overflow printf (a kernel build-time constant,
+-    so it must be set before the CUDA graphs are captured)."""
++    so it must be set before the CUDA graphs are captured). SM_WARN_OVERFLOW=1 leaves the printf on: a check run
++    uses it to see whether the contact / constraint buffers (nconmax, njmax) are large enough for a new scene."""
+ 
+     def apply_wp_opt(self, wp_opt) -> None:
++        import os
++
+         super().apply_wp_opt(wp_opt)
+-        wp_opt.warn_overflow = 0
++        if os.environ.get("SM_WARN_OVERFLOW") != "1":
++            wp_opt.warn_overflow = 0
+ 
+ 
+ TRACKED_BODIES = (
+-- 
+2.43.0
+

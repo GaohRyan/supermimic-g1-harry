@@ -1,0 +1,49 @@
+From af78f0fb9deefbea7110dc27273935845196da25 Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:29:16 -0500
+Subject: [PATCH 16/19] terrain: progress term on by default (weight 1.0)
+
+Scheme B of the plan (keep the robot from stopping in front of the stairs). Measured on the references: a robot that
+tracks pose, heading and joint motion but steps on the spot keeps 0.84-0.87 of the maximum tracking reward on
+walking clips and 0.71-0.74 on running clips: more than the trained policy earns while it actually walks (about
+0.80). The term is part of the imagined reward only; with weight 1.0 it is about 0.010 per step next to 0.012-0.018 for
+each tracking term (local Trainer run).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ src/supermimic/config.py           | 5 ++++-
+ src/supermimic/envs/mdp/rewards.py | 2 +-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/supermimic/config.py b/src/supermimic/config.py
+index 9a21b4b..f4b21f6 100644
+--- a/src/supermimic/config.py
++++ b/src/supermimic/config.py
+@@ -46,7 +46,10 @@ class EnvCfg:
+     terrain_clip_regex: str = r"^(walk|run|sprint)"  # clips that may start on a non-flat tile
+     scan_noise: float = 0.03  # m, half width of the uniform noise on the actor's height scan (simulator and imagination)
+     foot_clearance_weight: float = 30.0  # terrain task: weight of the foot-clearance shaping term of the imagined reward (0 = off)
+-    progress_weight: float = 0.0  # terrain task: weight of the progress term of the imagined reward (plan "scheme B", off by default)
++    # terrain task: weight of the progress term of the imagined reward (plan "scheme B": keep the robot from stopping in
++    # front of the stairs). Measured on the references: a robot that tracks everything but steps on the spot keeps
++    # 0.84-0.87 of the maximum tracking reward on walking clips, more than the trained policy gets while it walks.
++    progress_weight: float = 1.0
+ 
+ 
+ @dataclass
+diff --git a/src/supermimic/envs/mdp/rewards.py b/src/supermimic/envs/mdp/rewards.py
+index 3311d47..3adf99c 100644
+--- a/src/supermimic/envs/mdp/rewards.py
++++ b/src/supermimic/envs/mdp/rewards.py
+@@ -43,7 +43,7 @@ class TrackingRewardCfg:
+     clearance_margin: float = 0.04  # m above the highest terrain point under / ahead of the foot
+     clearance_sole_offset: float = 0.04  # height of the ankle-roll link origin above the sole (stance value of the references: 0.036-0.044)
+     clearance_ahead: tuple[float, ...] = (0.0, 0.05, 0.10, 0.15)  # sample points along the direction of travel of the foot, m
+-    w_progress: float = 0.0  # > 0: linear reward of the root speed along the reference travel direction (switch; default off)
++    w_progress: float = 0.0  # > 0: linear reward of the root speed along the reference travel direction, capped at the reference's speed (the terrain task turns it on: config.EnvCfg.progress_weight)
+ 
+     @property
+     def max_step_reward(self) -> float:
+-- 
+2.43.0
+

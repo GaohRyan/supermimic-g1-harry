@@ -1,0 +1,97 @@
+From e7842650604d0a6f14873de7b868008d0a866f1a Mon Sep 17 00:00:00 2001
+From: Hang(Harry) Gao <GaohRyan@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 01:26:24 -0500
+Subject: [PATCH 06/19] opt: mine world-model windows by one-step error on
+ index-only candidates (cheap scoring)
+
+Scoring all 8 steps of 4x candidates cost more than the training batch itself (3.3 -> 2.5 it/s on the Pod).
+Scoring one step with alpha 2 selects the same kind of windows (ground share 5.8% -> 15.1%, same mean window error)
+at about 1/8 of the model calls; the full windows are gathered only for the selected samples.
+---
+ src/supermimic/data/replay_buffer.py      | 12 +++++++++++-
+ src/supermimic/world_model/hard_mining.py |  3 ++-
+ src/supermimic/world_model/wm_trainer.py  | 13 ++++++++-----
+ 3 files changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/src/supermimic/data/replay_buffer.py b/src/supermimic/data/replay_buffer.py
+index 30a614d..28739ae 100644
+--- a/src/supermimic/data/replay_buffer.py
++++ b/src/supermimic/data/replay_buffer.py
+@@ -120,9 +120,19 @@ class ReplayBuffer:
+         idx = torch.multinomial(flat.float(), n, replacement=True)
+         return idx // self.T, idx % self.T
+ 
++    @torch.no_grad()
++    def sample_window_indices(self, n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
++        """(env, time) start indices of n uniformly drawn valid k-step windows."""
++        return self._sample_from_mask(self.window_mask(k), n)
++
+     @torch.no_grad()
+     def sample_windows(self, n: int, k: int) -> WindowBatch:
+-        e, t = self._sample_from_mask(self.window_mask(k), n)
++        e, t = self.sample_window_indices(n, k)
++        return self.windows_at(e, t, k)
++
++    @torch.no_grad()
++    def windows_at(self, e: torch.Tensor, t: torch.Tensor, k: int) -> WindowBatch:
++        n = e.numel()
+         offs = torch.arange(k + 1, device=self.device)
+         tt = (t[None, :] + offs[:, None]) % self.T  # (k+1, n)
+         ee = e[None, :].expand(k + 1, n)
+diff --git a/src/supermimic/world_model/hard_mining.py b/src/supermimic/world_model/hard_mining.py
+index 41ce788..cc366f1 100644
+--- a/src/supermimic/world_model/hard_mining.py
++++ b/src/supermimic/world_model/hard_mining.py
+@@ -3,7 +3,8 @@
+ Uniform replay sampling gives the model few examples of the phases where it is least accurate (e.g. the robot on the
+ ground: about 5 % of the data, 4-13x the error of standing). With mining, each training batch is built from a larger
+ uniformly drawn candidate set: a fraction `ratio` of the batch is drawn with probability proportional to the current
+-open-loop window error (error ** alpha), the rest stays uniform. Pure torch.
++open-loop error of the first step(s) of the window (error ** alpha), the rest stays uniform. Scoring one step with
++alpha 2 concentrates on the same windows as scoring all 8 steps with alpha 1 at about 1/8 of the cost. Pure torch.
+ """
+ 
+ from __future__ import annotations
+diff --git a/src/supermimic/world_model/wm_trainer.py b/src/supermimic/world_model/wm_trainer.py
+index 3d5e3a9..ac616eb 100644
+--- a/src/supermimic/world_model/wm_trainer.py
++++ b/src/supermimic/world_model/wm_trainer.py
+@@ -6,7 +6,7 @@ from dataclasses import dataclass
+ 
+ import torch
+ 
+-from supermimic.data.replay_buffer import ReplayBuffer, WindowBatch
++from supermimic.data.replay_buffer import ReplayBuffer, WindowBatch  # noqa: F401
+ from supermimic.envs.mdp.motion_library import MotionLibrary
+ from supermimic.world_model.heads import ReferenceFrame
+ from supermimic.training.distributed import allreduce_grads
+@@ -26,7 +26,8 @@ class WMTrainerCfg:
+     # Optimisation line: hard-example mining of the training windows (0 = off, plain uniform replay sampling).
+     hard_ratio: float = 0.0  # fraction of each batch drawn ~ window error ** hard_alpha from the candidates
+     hard_candidates: int = 4  # candidate windows per batch slot (uniform draws)
+-    hard_alpha: float = 1.0
++    hard_alpha: float = 2.0
++    hard_score_steps: int = 1  # open-loop steps used to score the candidates (1 = one model call per candidate)
+ 
+ 
+ def reference_at(lib: MotionLibrary, frame: torch.Tensor) -> ReferenceFrame:
+@@ -59,11 +60,13 @@ class WorldModelTrainer:
+         for _ in range(self.cfg.batches_per_update):
+             mined = None
+             if self.cfg.hard_ratio > 0:
+-                c = buffer.sample_windows(self.cfg.batch_size * self.cfg.hard_candidates, self.cfg.window)
++                # Score cheap, short windows of many candidates, then gather the full windows of the chosen ones only.
++                ks = self.cfg.hard_score_steps
++                e, t = buffer.sample_window_indices(self.cfg.batch_size * self.cfg.hard_candidates, self.cfg.window)
++                c = buffer.windows_at(e, t, ks)
+                 err = window_error(self.wm, c.states, c.a_exec, c.xi)
+                 idx = mine_indices(err, self.cfg.batch_size, self.cfg.hard_ratio, self.cfg.hard_alpha)
+-                w = WindowBatch(states=c.states[:, idx], a_exec=c.a_exec[:, idx], a_clean=c.a_clean[:, idx], xi=c.xi[idx],
+-                                reward=c.reward[:, idx], done=c.done[:, idx], frame=c.frame[:, idx])
++                w = buffer.windows_at(e[idx], t[idx], self.cfg.window)
+                 mined = (err.mean(), err[idx].mean())
+             else:
+                 w = buffer.sample_windows(self.cfg.batch_size, self.cfg.window)
+-- 
+2.43.0
+

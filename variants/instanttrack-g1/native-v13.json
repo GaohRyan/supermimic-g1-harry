@@ -1,0 +1,14 @@
+{
+ "project_id": "instanttrack-g1",
+ "line": "opt",
+ "base_repo": "https://github.com/Huy-Quang-Dao/instantTrack.git",
+ "base_commit": "9474e74c623e11dda8868de28d908b15ff93edd1",
+ "variant_commit": "8a8e2e6b82c53c11a2966dec52a44499ce786c1d",
+ "patches": [
+  {
+   "file": "0001-evaluate-record-root-joint-velocities-per-step-rewar.patch",
+   "sha256": "5803f7c13390eb4fba68f7e964ec1d66291b799eb988113fb08db4d9d58cd5ec"
+  }
+ ],
+ "note_public": "Patch author lines were normalised for publication; variant_tree is unchanged, commit SHAs after git am differ."
+}
