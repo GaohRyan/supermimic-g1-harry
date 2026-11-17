@@ -345,6 +345,19 @@ Before training, the flat policy did not fall on 20 cm stairs up in only 0.08 of
 but can stop halfway. Slopes and rough heightfield tiles are off, because foot contact on heightfields differed from boxes
 in MuJoCo C (flat policy fell in 25–50% of windows on a flat heightfield vs 0–4% on boxes). No latent-versus-raw scan comparison.
 
+**Caveat: the height scan is idealized (sim-to-real gap not closed).** In simulation the actor receives all 187 scan
+points every step, including the cells directly under the body, with only ±3 cm of uniform noise. A real robot does not
+get that: a head-mounted LiDAR cannot see under the torso or right next to the feet (self-occlusion and minimum range),
+so those cells are either stale values remembered by a local elevation map (seen a few steps earlier, delayed, and
+drifting with odometry) or have no reading at all. The scan dots under the robot in our demo videos exist only because
+of this idealization. Before hardware, the scan model has to come from the robot, i.e. real-to-sim:
+- measure the sensor on the real G1: per-cell noise, dropout, latency, and which cells are blind for the actual mounting;
+- train with a per-cell validity mask (invalid cells filled with a constant) and with the measured noise, delay and map drift;
+- add an evaluation with the under-body cells masked.
+
+None of the stairs numbers above cover these conditions. Only the actor's input changes; the world model and critic
+keep using ground truth from the height map.
+
 **Pitfalls specific to this step.**
 - Picking the most stair-like clip in a dataset (35 cm then 70 cm) as the first target, instead of a curriculum from 5 cm.
 - Changing the world model's root-height input from "cell under the root" to "mean under the body" on reasoning alone; on
@@ -387,6 +400,8 @@ in MuJoCo C (flat policy fell in 25–50% of windows on a flat heightfield vs 0�
 
 - Stairs: a second training seed; separating the two changes of the final line; a latent-versus-raw scan comparison;
   slopes and rough terrain once heightfield contact is checked in MuJoCo Warp.
+- Stairs on hardware: a real-to-sim scan model (measured noise, blind cells, latency) and retraining with a validity
+  mask; see the caveat in Section 10.
 - Multiple seeds for every row of the results table.
 - Muon versus weight decay alone (Section 8).
 - The remaining official-contract differences on the world-model side (listed in the variant's `not_aligned` field).

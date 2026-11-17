@@ -45,6 +45,8 @@ Robustness, held-out and sim2sim numbers are in [NOTES §2, §5](docs/NOTES.md).
 | Random step heights | 1.00 | 0.98 | 0.46 |
 
 Flat-ground LAFAN40 after stairs training: 40/40, 0.824 (0.827 before). Details in [NOTES §10](docs/NOTES.md#10-stairs-terrain-level-1).
+Caveat: the scan is idealized in simulation (no blind cells under the body, simple noise); hardware needs a
+real-to-sim scan model first.
 
 ## Repository layout
 
